@@ -1,0 +1,33 @@
+Received: from mail.group.example (10.0.0.5) by mx2.example (10.0.0.9); Wed, 14 Jun 2023 07:15:03 +0000
+Received: from laptop-cfo (10.1.1.20) by mail.group.example (10.0.0.5); Wed, 14 Jun 2023 07:15:01 +0000
+From: "Jane CFO" <cfo@group.example>
+Sender: "Assistant" <pa@group.example>
+To: director1@offshore.example, "Director Two" <director2@offshore.example>
+Cc: =?utf-8?q?Andr=C3=A9_Legal?= <legal@group.example>
+Subject: =?utf-8?q?Board_pack_=E2=80=93_Project_Falcon?=
+Date: Wed, 14 Jun 2023 09:15:00 +0200
+Message-ID: <falcon-001@group.example>
+In-Reply-To: <falcon-000@group.example>
+References: <falcon-root@group.example>
+ <falcon-000@group.example>
+X-Mailer: Microsoft Outlook 16.0
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BOUNDARY"
+
+--BOUNDARY
+Content-Type: text/plain; charset="utf-8"
+
+Please approve the attached resolution today. We have already agreed terms.
+
+--BOUNDARY
+Content-Type: text/plain; name="minutes.txt"
+Content-Disposition: attachment; filename="minutes.txt"
+
+Draft minutes D1
+--BOUNDARY
+Content-Type: application/octet-stream; name="data.bin"
+Content-Disposition: attachment; filename="data.bin"
+Content-Transfer-Encoding: base64
+
+aGVsbG8=
+--BOUNDARY--

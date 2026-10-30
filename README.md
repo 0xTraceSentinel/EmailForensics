@@ -10,7 +10,28 @@ The tool doesn't give a verdict. It turns a pile of exported email into **eviden
 
 > Background on the legal test and the investigative method: [`docs/methodology.md`](docs/methodology.md)
 
-> Status: early design. Nothing below is implemented yet.
+> Status: M1 (EML/MBOX ingest) in progress. `init` and `ingest` exist; everything else below is design.
+
+## Getting started
+
+```bash
+docker compose up -d                   # local PostgreSQL 16 on 127.0.0.1:5432
+python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+
+emailforensics init cases/case01
+emailforensics ingest cases/case01 exports/ --custodian cfo
+```
+
+The server connection comes from `EMAILFORENSICS_DSN` (default: the Docker Compose credentials). Each case gets its own database (`ef_<case name>`), with attachment bytes stored content-addressed under `<case>/blobs/`.
+
+What ingest records for M1:
+- **Source files:** absolute path, size and SHA-256, hashed before and after reading. If the hash changes, that file's import is rolled back. A file already ingested (same hash) is skipped.
+- **Messages:** item path inside the source (`eml`, `mbox:12`, `mbox:12/rfc822:2` for embedded messages), byte offset and length, SHA-256 of the stored bytes, all raw headers in order, `Date` as UTC **plus the original offset** (`NULL` for `-0000`), addresses, threading IDs, bodies, parse defects, and full-text search over subject and body.
+- **Attachments:** MIME part number, filename, type, size and SHA-256.
+- **Ingest runs:** tool version, command line, custodian and any per-file errors.
+
+Tests: `pytest`. The database test runs only when `EMAILFORENSICS_TEST_DSN` is set, e.g. `postgresql://emailforensics:emailforensics@localhost:5432/postgres`.
 
 ---
 

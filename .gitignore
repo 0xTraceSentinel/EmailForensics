@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+cases/
+exports/
+*.pst
+*.ost
+*.msg
+!tests/fixtures/**

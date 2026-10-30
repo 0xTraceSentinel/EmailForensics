@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "emailforensics"
+version = "0.1.0"
+description = "Offline toolkit for analysing exported mailboxes as POEM (place of effective management) evidence."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+emailforensics = "emailforensics.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/emailforensics"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

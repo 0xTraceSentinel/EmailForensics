@@ -1,0 +1,26 @@
+From: director1@offshore.example
+To: cfo@group.example
+Subject: Fwd: Term sheet
+Date: Thu, 15 Jun 2023 11:00:00 +0400
+Message-ID: <fwd-001@offshore.example>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="OUTER"
+
+--OUTER
+Content-Type: text/plain; charset="us-ascii"
+
+See below.
+
+--OUTER
+Content-Type: message/rfc822
+
+From: banker@bank.example
+To: director1@offshore.example
+Subject: Term sheet
+Date: Mon, 12 Jun 2023 08:30:00 +0100
+Message-ID: <ts-001@bank.example>
+Content-Type: text/plain; charset="us-ascii"
+
+Term sheet attached as discussed in Sandton.
+
+--OUTER--

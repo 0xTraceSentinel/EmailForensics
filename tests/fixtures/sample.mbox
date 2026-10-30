@@ -1,0 +1,29 @@
+From cfo@group.example Tue Jun 13 08:00:00 2023
+From: cfo@group.example
+To: ceo@group.example
+Subject: Falcon go-ahead
+Date: Tue, 13 Jun 2023 10:00:00 +0200
+Message-ID: <m1@group.example>
+
+We're going ahead, tell the bank.
+From here the board just needs to sign off.
+
+From ceo@group.example Tue Jun 13 09:00:00 2023
+From: ceo@group.example
+To: cfo@group.example
+Subject: Re: Falcon go-ahead
+Date: Tue, 13 Jun 2023 11:00:00 +0200
+Message-ID: <m2@group.example>
+In-Reply-To: <m1@group.example>
+
+Agreed.
+
+>From the desk of the CEO
+
+From unknown@example Wed Jun 14 00:00:00 2023
+From: unknown@example
+Subject: No zone
+Date: Wed, 14 Jun 2023 00:00:00 -0000
+Message-ID: <m3@example>
+
+Body.
