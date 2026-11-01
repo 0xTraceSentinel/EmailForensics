@@ -12,12 +12,18 @@ from emailforensics.ingest.mbox import split_mbox, unescape
 from emailforensics.ingest.parse import parse_message
 from emailforensics.store import db, writer
 
-_EXTENSIONS = {".eml": "eml", ".mbox": "mbox", ".mbx": "mbox"}
-_LATER = {".pst", ".ost", ".msg"}
+_EXTENSIONS = {".eml": "eml", ".mbox": "mbox", ".mbx": "mbox", ".pst": "pst", ".ost": "ost", ".msg": "msg"}
+_CFB_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
 class EvidenceChanged(RuntimeError):
     pass
+
+
+@dataclass
+class ItemError:
+    item_path: str
+    error: str
 
 
 @dataclass
@@ -27,6 +33,7 @@ class FileResult:
     detail: str = ""
     messages: int = 0
     attachments: int = 0
+    item_errors: list[ItemError] = field(default_factory=list)
 
 
 @dataclass
@@ -38,17 +45,24 @@ class IngestSummary:
     def errors(self) -> list[FileResult]:
         return [f for f in self.files if f.status == "error"]
 
+    @property
+    def item_errors(self) -> list[tuple[Path, ItemError]]:
+        return [(f.path, e) for f in self.files for e in f.item_errors]
+
 
 def detect_format(path: Path, explicit: bool) -> str | None:
     ext = path.suffix.lower()
     if ext in _EXTENSIONS:
         return _EXTENSIONS[ext]
-    if ext in _LATER:
-        return None
     with open(path, "rb") as f:
-        if f.read(5) == b"From ":
-            return "mbox"
-    return "eml" if explicit else None
+        head = f.read(8)
+    if head[:5] == b"From ":
+        return "mbox"
+    if head[:4] == b"!BDN":
+        return "pst"
+    if explicit:
+        return "msg" if head == _CFB_SIGNATURE else "eml"
+    return None
 
 
 def expand_inputs(inputs: list[str]) -> list[tuple[Path, bool]]:
@@ -68,21 +82,54 @@ def expand_inputs(inputs: list[str]) -> list[tuple[Path, bool]]:
     return sorted(found.items(), key=lambda kv: str(kv[0]))
 
 
+def _ingest_pst(conn, blobs, source_id: int, path: Path, result: FileResult) -> None:
+    from emailforensics.ingest.mapi import to_parsed
+    from emailforensics.ingest.pst import read_pst
+
+    for entry in read_pst(path):
+        if entry.error is not None:
+            result.item_errors.append(ItemError(entry.item_path, entry.error))
+            continue
+        try:
+            with conn.transaction():
+                msg = to_parsed(entry.item)
+                m, a = writer.insert_message(
+                    conn, blobs, source_id, entry.item_path, msg.sha256, msg,
+                    folder_path=entry.folder_path, item_state=entry.state,
+                )
+        except Exception as e:
+            result.item_errors.append(ItemError(entry.item_path, f"{type(e).__name__}: {e}"))
+            continue
+        result.messages += m
+        result.attachments += a
+
+
+def _ingest_msg(conn, blobs, source_id: int, path: Path, result: FileResult) -> None:
+    from emailforensics.ingest.mapi import to_parsed
+    from emailforensics.ingest.msg import read_msg
+
+    msg = to_parsed(read_msg(path))
+    result.messages, result.attachments = writer.insert_message(conn, blobs, source_id, "msg", msg.sha256, msg)
+
+
 def _ingest_file(conn, case: Case, run_id: int, path: Path, fmt: str, custodian: str | None) -> FileResult:
     sha_before = sha256_file(path)
     if writer.source_exists(conn, sha_before):
         return FileResult(path, "skipped", f"already ingested (sha256 {sha_before[:12]})")
 
     blobs = case.blobs
-    n_msgs = n_atts = 0
+    result = FileResult(path, "ingested", f"sha256 {sha_before[:12]}")
     with conn.transaction():
         source_id = writer.insert_source(conn, run_id, path, fmt, sha_before, custodian)
         if fmt == "eml":
             raw = path.read_bytes()
-            m, a = writer.insert_message(
+            result.messages, result.attachments = writer.insert_message(
                 conn, blobs, source_id, "eml", sha_before, parse_message(raw), byte_offset=0, byte_length=len(raw)
             )
-            n_msgs, n_atts = m, a
+        elif fmt in ("pst", "ost"):
+            _ingest_pst(conn, blobs, source_id, path, result)
+        elif fmt == "msg":
+            _ingest_msg(conn, blobs, source_id, path, result)
         elif path.stat().st_size:
             with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
                 for entry in split_mbox(data):
@@ -91,14 +138,14 @@ def _ingest_file(conn, case: Case, run_id: int, path: Path, fmt: str, custodian:
                         parse_message(unescape(entry.raw)),
                         byte_offset=entry.offset, byte_length=len(entry.raw), envelope_from=entry.envelope,
                     )
-                    n_msgs += m
-                    n_atts += a
+                    result.messages += m
+                    result.attachments += a
 
         sha_after = sha256_file(path)
         if sha_after != sha_before:
             raise EvidenceChanged(f"{path} changed while being read ({sha_before} -> {sha_after})")
 
-    return FileResult(path, "ingested", f"sha256 {sha_before[:12]}", n_msgs, n_atts)
+    return result
 
 
 def ingest_paths(case: Case, inputs: list[str], custodian: str | None, argv: list[str]) -> IngestSummary:
@@ -109,8 +156,8 @@ def ingest_paths(case: Case, inputs: list[str], custodian: str | None, argv: lis
             try:
                 fmt = detect_format(path, explicit)
                 if fmt is None:
-                    if explicit or path.suffix.lower() in _LATER:
-                        summary.files.append(FileResult(path, "unsupported", "format not supported yet"))
+                    if explicit:
+                        summary.files.append(FileResult(path, "unsupported", "format not recognised"))
                     continue
                 summary.files.append(_ingest_file(conn, case, summary.run_id, path, fmt, custodian))
             except Exception as e:
@@ -118,6 +165,7 @@ def ingest_paths(case: Case, inputs: list[str], custodian: str | None, argv: lis
         writer.finish_run(
             conn,
             summary.run_id,
-            [{"path": str(f.path.resolve()), "error": f.detail} for f in summary.errors],
+            [{"path": str(f.path.resolve()), "error": f.detail} for f in summary.errors]
+            + [{"path": str(p.resolve()), "item": e.item_path, "error": e.error} for p, e in summary.item_errors],
         )
     return summary

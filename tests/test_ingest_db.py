@@ -68,3 +68,31 @@ def test_ingest_records_provenance_and_is_idempotent(case, evidence):
     assert {f.status for f in second.files} == {"skipped"}
 
     assert {p.name: sha256_file(p) for p in evidence.iterdir()} == hashes_before
+
+
+def test_msg_ingest_records_mapi_columns(case, tmp_path):
+    from test_msg import SUBMIT, build_msg
+
+    evidence = tmp_path / "msg"
+    evidence.mkdir()
+    build_msg(evidence / "falcon.msg")
+
+    summary = ingest_paths(case, [str(evidence)], custodian="cfo", argv=["test"])
+    assert not summary.errors and not summary.item_errors
+
+    with db.connect(case.dsn) as conn:
+        assert conn.execute("SELECT format FROM source_file").fetchone() == ("msg",)
+        row = conn.execute(
+            "SELECT item_path, hash_basis, message_class, client_submit_time, sent_representing->0->>'address',"
+            " mapi_recipients->0->>'type', mapi_props->'0x001a001f'->>'value'"
+            " FROM message WHERE parent_id IS NULL"
+        ).fetchone()
+        assert row == ("msg", "mapi", "IPM.Note", SUBMIT, "cfo@group.example", "cc", "IPM.Note")
+        child = conn.execute(
+            "SELECT c.item_path, c.subject, a.sha256 = c.sha256 FROM message c"
+            " JOIN attachment a ON a.msg_id = c.parent_id AND a.mime_path = '2'"
+        ).fetchone()
+        assert child == ("msg/att:2", "Term sheet", True)
+        assert conn.execute(
+            "SELECT mapi_props->'0x37050003'->>'value' FROM attachment WHERE mime_path = '1'"
+        ).fetchone() == ("1",)
