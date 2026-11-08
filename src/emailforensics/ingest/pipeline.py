@@ -17,6 +17,10 @@ _EXTENSIONS = {".eml": "eml", ".mbox": "mbox", ".mbx": "mbox", ".pst": "pst", ".
 _CFB_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
+BATCH_ITEMS = 500
+BATCH_BYTES = 32 << 20
+
+
 class EvidenceChanged(RuntimeError):
     pass
 
@@ -83,6 +87,55 @@ def expand_inputs(inputs: list[str]) -> list[tuple[Path, bool]]:
     return sorted(found.items(), key=lambda kv: str(kv[0]))
 
 
+class _Batch:
+    def __init__(self, conn, blobs, source_id: int, result: FileResult, isolate: bool) -> None:
+        self.conn, self.blobs, self.source_id, self.result, self.isolate = conn, blobs, source_id, result, isolate
+        self.items: list[tuple[int, writer.NewMessage]] = []
+        self.size = 0
+        self.errors: list[tuple[int, ItemError]] = []
+
+    def add(self, item: writer.NewMessage, seq: int = 0) -> None:
+        self.items.append((seq, item))
+        self.size += writer.payload_bytes(item.msg)
+        if len(self.items) >= BATCH_ITEMS or self.size >= BATCH_BYTES:
+            self.flush()
+
+    def error(self, seq: int, item_path: str, error: str) -> None:
+        self.errors.append((seq, ItemError(item_path, error)))
+
+    def flush(self) -> None:
+        pending, self.items, self.size = self.items, [], 0
+        if not pending:
+            return
+        items = [item for _, item in pending]
+        if not self.isolate:
+            self._count(writer.insert_messages(self.conn, self.blobs, self.source_id, items))
+            return
+        try:
+            with self.conn.transaction():
+                counts = writer.insert_messages(self.conn, self.blobs, self.source_id, items)
+        except Exception:
+            for seq, item in pending:
+                try:
+                    with self.conn.transaction():
+                        counts = writer.insert_messages(self.conn, self.blobs, self.source_id, [item])
+                except Exception as e:
+                    self.error(seq, item.item_path, f"{type(e).__name__}: {e}")
+                    continue
+                self._count(counts)
+            return
+        self._count(counts)
+
+    def finish(self) -> None:
+        self.flush()
+        self.result.item_errors.extend(e for _, e in sorted(self.errors, key=lambda se: se[0]))
+        self.errors = []
+
+    def _count(self, counts: tuple[int, int]) -> None:
+        self.result.messages += counts[0]
+        self.result.attachments += counts[1]
+
+
 def _ingest_pst(conn, blobs, source_id: int, path: Path, result: FileResult, progress: IngestProgress) -> None:
     from emailforensics.ingest.mapi import to_parsed
     from emailforensics.ingest.pst import read_pst
@@ -95,22 +148,20 @@ def _ingest_pst(conn, blobs, source_id: int, path: Path, result: FileResult, pro
         progress.update(done)
 
     progress.stage("opening", None)
-    for entry in read_pst(path, on_total=lambda total: progress.stage("items", total), tick=tick):
+    batch = _Batch(conn, blobs, source_id, result, isolate=True)
+    entries = read_pst(path, on_total=lambda total: progress.stage("items", total), tick=tick)
+    for seq, entry in enumerate(entries):
         if entry.error is not None:
-            result.item_errors.append(ItemError(entry.item_path, entry.error))
+            batch.error(seq, entry.item_path, entry.error)
             continue
         try:
-            with conn.transaction():
-                msg = to_parsed(entry.item)
-                m, a = writer.insert_message(
-                    conn, blobs, source_id, entry.item_path, msg.sha256, msg,
-                    folder_path=entry.folder_path, item_state=entry.state,
-                )
+            msg = to_parsed(entry.item)
         except Exception as e:
-            result.item_errors.append(ItemError(entry.item_path, f"{type(e).__name__}: {e}"))
+            batch.error(seq, entry.item_path, f"{type(e).__name__}: {e}")
             continue
-        result.messages += m
-        result.attachments += a
+        new = writer.NewMessage(entry.item_path, msg.sha256, msg, folder_path=entry.folder_path, item_state=entry.state)
+        batch.add(new, seq)
+    batch.finish()
 
 
 def _ingest_msg(conn, blobs, source_id: int, path: Path, result: FileResult) -> None:
@@ -146,18 +197,17 @@ def _ingest_file(
             _ingest_msg(conn, blobs, source_id, path, result)
         elif size:
             progress.stage("scanning", None)
+            batch = _Batch(conn, blobs, source_id, result, isolate=False)
             with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
                 for entry in split_mbox(data):
                     if entry.index == 0:
                         progress.stage("messages", size, "bytes")
-                    m, a = writer.insert_message(
-                        conn, blobs, source_id, f"mbox:{entry.index}", sha256_bytes(entry.raw),
-                        parse_message(unescape(entry.raw)),
+                    batch.add(writer.NewMessage(
+                        f"mbox:{entry.index}", sha256_bytes(entry.raw), parse_message(unescape(entry.raw)),
                         byte_offset=entry.offset, byte_length=len(entry.raw), envelope_from=entry.envelope,
-                    )
-                    result.messages += m
-                    result.attachments += a
+                    ))
                     progress.update(entry.offset + len(entry.raw))
+                batch.finish()
 
         progress.stage("verifying hash", size, "bytes")
         sha_after = sha256_file(path, progress.update)

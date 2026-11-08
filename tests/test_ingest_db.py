@@ -129,3 +129,55 @@ def test_progress_reports_stages_and_reaches_file_size(case, evidence):
     hash_at = rec.events.index(("stage", "verifying hash", size, "bytes"))
     updates = [e[1] for e in rec.events[messages_at:hash_at] if e[0] == "update"]
     assert updates == sorted(updates) and len(updates) == 3 and updates[-1] <= size
+
+
+def test_pst_batches_isolate_bad_items_and_keep_error_order(case, tmp_path, monkeypatch):
+    from test_mapi import note, pinned_item
+
+    from emailforensics.ingest import mapi, pipeline, pst
+    from emailforensics.store import writer
+
+    monkeypatch.setattr(pipeline, "BATCH_ITEMS", 4)
+    monkeypatch.setattr(writer, "_MAX_PARAMS", 100)
+
+    def fake_read_pst(path, on_total=None, tick=None):
+        for i in range(9):
+            if i == 6:
+                yield pst.PstEntry(f"pst:{i}", ["Inbox"], "live", error="OSError: bad block")
+                continue
+            item = pinned_item() if i % 2 else note()
+            item.defects.append(f"seq {i}")
+            yield pst.PstEntry(f"pst:{i}", ["Inbox"], "live", item)
+
+    real_to_parsed = mapi.to_parsed
+
+    def to_parsed(item):
+        msg = real_to_parsed(item)
+        if "seq 4" in item.defects:
+            msg.date_utc = 12345
+        return msg
+
+    monkeypatch.setattr(pst, "read_pst", fake_read_pst)
+    monkeypatch.setattr(mapi, "to_parsed", to_parsed)
+    evidence = tmp_path / "pst"
+    evidence.mkdir()
+    (evidence / "cfo.pst").write_bytes(b"!BDN placeholder")
+
+    summary = ingest_paths(case, [str(evidence)], custodian="cfo", argv=["test"])
+    [f] = summary.files
+    assert f.status == "ingested"
+    assert [e.item_path for e in f.item_errors] == ["pst:4", "pst:6"]
+    assert f.item_errors[0].error.startswith("DatatypeMismatch")
+
+    with db.connect(case.dsn) as conn:
+        top = [r[0] for r in conn.execute("SELECT item_path FROM message WHERE parent_id IS NULL ORDER BY id")]
+        assert top == ["pst:0", "pst:1", "pst:2", "pst:3", "pst:5", "pst:7", "pst:8"]
+        children = conn.execute(
+            "SELECT c.item_path, p.item_path, c.id > p.id FROM message c JOIN message p ON p.id = c.parent_id"
+            " ORDER BY c.id"
+        ).fetchall()
+        assert children == [(f"pst:{i}/att:2", f"pst:{i}", True) for i in (1, 3, 5, 7)]
+        assert f.messages == conn.execute("SELECT count(*) FROM message").fetchone()[0] == 11
+        assert f.attachments == conn.execute("SELECT count(*) FROM attachment").fetchone()[0] == 12
+        shas = [r[0] for r in conn.execute("SELECT sha256 FROM message WHERE item_path = 'pst:1'")]
+        assert shas == ["123e820ca324ad46048f960de55ecc9ffa3de4e6886bf255372c785891b83ac8"]

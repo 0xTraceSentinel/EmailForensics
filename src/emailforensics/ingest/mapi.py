@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import codecs
+import hashlib
+import math
 import struct
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -361,8 +364,8 @@ def _jsonable(v):
         return v.hex()
     if isinstance(v, str):
         return clean(v)
-    if isinstance(v, float) and v != v:
-        return None
+    if isinstance(v, float) and not math.isfinite(v):
+        return "NaN" if v != v else ("Infinity" if v > 0 else "-Infinity")
     if isinstance(v, list):
         return [_jsonable(x) for x in v]
     return v
@@ -385,7 +388,7 @@ def props_json(props: Props, codepage: str) -> dict:
     return out
 
 
-def _canonical_props(props: Props) -> bytes:
+def _canonical_props(props: Props) -> Iterator[bytes]:
     keyed = []
     for p in props.values():
         if p.named is not None:
@@ -393,24 +396,39 @@ def _canonical_props(props: Props) -> bytes:
         else:
             key = b"T" + struct.pack(">HH", p.id, p.type)
         keyed.append((key, p.data))
-    out = bytearray()
     for key, data in sorted(keyed, key=lambda kv: kv[0]):
-        out += struct.pack("<I", len(key)) + key
-        out += b"\xff" * 8 if data is None else struct.pack("<Q", len(data)) + data
-    return bytes(out)
+        yield struct.pack("<I", len(key)) + key
+        if data is None:
+            yield b"\xff" * 8
+        else:
+            yield struct.pack("<Q", len(data))
+            yield data
+
+
+def canonical_parts(item: MapiItem) -> Iterator[bytes]:
+    yield b"EFMAPI1\n"
+    yield b"P"
+    yield from _canonical_props(item.props)
+    for r in item.recipients:
+        yield b"R"
+        yield from _canonical_props(r)
+    for a in item.attachments:
+        yield b"A"
+        yield from _canonical_props(a.props)
+        if a.embedded is not None:
+            yield b"E" + struct.pack("<Q", sum(len(part) for part in canonical_parts(a.embedded)))
+            yield from canonical_parts(a.embedded)
 
 
 def canonical_bytes(item: MapiItem) -> bytes:
-    out = bytearray(b"EFMAPI1\n")
-    out += b"P" + _canonical_props(item.props)
-    for r in item.recipients:
-        out += b"R" + _canonical_props(r)
-    for a in item.attachments:
-        out += b"A" + _canonical_props(a.props)
-        if a.embedded is not None:
-            inner = canonical_bytes(a.embedded)
-            out += b"E" + struct.pack("<Q", len(inner)) + inner
-    return bytes(out)
+    return b"".join(canonical_parts(item))
+
+
+def canonical_sha256(item: MapiItem) -> str:
+    h = hashlib.sha256()
+    for part in canonical_parts(item):
+        h.update(part)
+    return h.hexdigest()
 
 
 def item_codepage(props: Props, default: str) -> str:
@@ -423,6 +441,15 @@ def _text(props: Props, pid: int, codepage: str) -> str | None:
     if isinstance(v, bytes):
         v = v.decode(codepage, "replace")
     return clean(v) if isinstance(v, str) and v != "" else None
+
+
+def _time(props: Props, pid: int, defects: list[str]) -> datetime | None:
+    prop = props.get(pid)
+    v = decode(prop)
+    if v is None or isinstance(v, datetime):
+        return v
+    defects.append(f"{NAMES.get(pid, f'0x{pid:04x}')} has type 0x{prop.type:04x}, not PT_SYSTIME; ignored")
+    return None
 
 
 def _subject(props: Props, codepage: str) -> str | None:
@@ -502,8 +529,10 @@ def to_parsed(item: MapiItem) -> ParsedMessage:
         hp = parse_message(raw_headers.strip("\r\n").encode("utf-8", "surrogateescape") + b"\r\n\r\n")
         defects.extend(d for d in hp.defects if d not in _HEADER_ONLY_DEFECTS)
 
-    submit = decode(p.get(PR_CLIENT_SUBMIT_TIME))
-    delivery = decode(p.get(PR_MESSAGE_DELIVERY_TIME))
+    submit = _time(p, PR_CLIENT_SUBMIT_TIME, defects)
+    delivery = _time(p, PR_MESSAGE_DELIVERY_TIME, defects)
+    created = _time(p, PR_CREATION_TIME, defects)
+    modified = _time(p, PR_LAST_MODIFICATION_TIME, defects)
     recipients = [_recipient(r, cp) for r in item.recipients]
 
     def mapi_addrs(kind: str) -> list[dict]:
@@ -546,7 +575,7 @@ def to_parsed(item: MapiItem) -> ParsedMessage:
     conv_index = decode(p.get(PR_CONVERSATION_INDEX))
 
     return ParsedMessage(
-        sha256=sha256_bytes(canonical_bytes(item)),
+        sha256=canonical_sha256(item),
         headers=hp.headers if hp else [],
         rfc_message_id=(hp.rfc_message_id if hp else None) or _text(p, PR_INTERNET_MESSAGE_ID, cp),
         in_reply_to=in_reply_to,
@@ -570,8 +599,8 @@ def to_parsed(item: MapiItem) -> ParsedMessage:
             message_class=_text(p, PR_MESSAGE_CLASS, cp),
             client_submit_time=submit,
             delivery_time=delivery,
-            creation_time=decode(p.get(PR_CREATION_TIME)),
-            last_modification_time=decode(p.get(PR_LAST_MODIFICATION_TIME)),
+            creation_time=created,
+            last_modification_time=modified,
             last_modifier_name=_text(p, PR_LAST_MODIFIER_NAME, cp),
             sent_representing=representing,
             conversation_index=conv_index if isinstance(conv_index, bytes) else None,

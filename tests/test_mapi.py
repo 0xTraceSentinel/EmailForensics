@@ -1,3 +1,5 @@
+import hashlib
+import json
 import struct
 import uuid
 from datetime import datetime, timezone
@@ -9,6 +11,7 @@ from emailforensics.ingest.mapi import (
     NamedProp,
     Prop,
     canonical_bytes,
+    canonical_sha256,
     decode,
     pack_multi,
     parse_name_map,
@@ -163,3 +166,80 @@ def test_attachments_and_embedded_message():
     assert path == "2"
     assert child.subject == "Term sheet"
     assert msg.sha256 == child.sha256
+
+
+def pinned_item() -> MapiItem:
+    item = note(
+        Prop(0x8010, 0x001F, u("Falcon"), NamedProp(PS_PUBLIC_STRINGS, None, "Keywords")),
+        Prop(0x8011, 0x0040, ft(SUBMIT), NamedProp(PSETID_APPOINTMENT, 0x820D, None)),
+        Prop(0x6001, 0x0102, None),
+    )
+    inner = note(Prop(0x0037, 0x001F, u("Draft resolution")))
+    inner.attachments = [MapiAttachment(props(
+        Prop(0x3705, 0x0003, struct.pack("<i", 1)),
+        Prop(0x3707, 0x001F, u("resolution.docx")),
+        Prop(0x3701, 0x0102, bytes(range(256)) * 300),
+    ))]
+    item.attachments = [
+        MapiAttachment(props(
+            Prop(0x3705, 0x0003, struct.pack("<i", 1)),
+            Prop(0x3707, 0x001F, u("minutes.pdf")),
+            Prop(0x3701, 0x0102, b"%PDF-1.7 minutes" * 1000),
+        )),
+        MapiAttachment(props(Prop(0x3705, 0x0003, struct.pack("<i", 5))), inner),
+    ]
+    return item
+
+
+PINNED_MESSAGE_SHA256 = "123e820ca324ad46048f960de55ecc9ffa3de4e6886bf255372c785891b83ac8"
+PINNED_EMBEDDED_SHA256 = "6769e337bedb95c747f866ea8adb2f3ae56ece1ee8952e3249497089885718ce"
+
+
+def test_canonical_hash_is_unchanged_from_the_buffered_implementation():
+    item = pinned_item()
+    parsed = to_parsed(item)
+    assert parsed.sha256 == PINNED_MESSAGE_SHA256
+    assert parsed.attachments[1].sha256 == PINNED_EMBEDDED_SHA256
+    assert parsed.children[0][1].sha256 == PINNED_EMBEDDED_SHA256
+    assert canonical_sha256(item) == hashlib.sha256(canonical_bytes(item)).hexdigest()
+
+
+def test_non_finite_floats_are_stored_as_json_strings():
+    item = note(
+        Prop(0x6001, 0x0005, struct.pack("<d", float("inf"))),
+        Prop(0x6002, 0x0005, struct.pack("<d", float("-inf"))),
+        Prop(0x6003, 0x0005, struct.pack("<d", float("nan"))),
+        Prop(0x6004, 0x1005, struct.pack("<2d", 1.5, float("inf"))),
+    )
+    props = to_parsed(item).mapi.props
+    assert props["0x60010005"]["value"] == "Infinity"
+    assert props["0x60020005"]["value"] == "-Infinity"
+    assert props["0x60030005"]["value"] == "NaN"
+    assert props["0x60041005"]["value"] == [1.5, "Infinity"]
+    json.loads(json.dumps(props, allow_nan=False))
+
+
+def test_time_properties_with_the_wrong_type_are_ignored_and_flagged():
+    item = note(
+        Prop(0x0039, 0x0003, struct.pack("<i", 7)),
+        Prop(0x0E06, 0x0102, b"\x01\x02"),
+        Prop(0x3007, 0x001F, u("yesterday")),
+        Prop(0x3008, 0x1040, ft(SUBMIT) * 2),
+    )
+    m = to_parsed(item)
+    assert m.date_utc is None
+    assert m.mapi.client_submit_time is None and m.mapi.delivery_time is None
+    assert m.mapi.creation_time is None and m.mapi.last_modification_time is None
+    assert [d for d in m.defects if "not PT_SYSTIME" in d] == [
+        "PR_CLIENT_SUBMIT_TIME has type 0x0003, not PT_SYSTIME; ignored",
+        "PR_MESSAGE_DELIVERY_TIME has type 0x0102, not PT_SYSTIME; ignored",
+        "PR_CREATION_TIME has type 0x001f, not PT_SYSTIME; ignored",
+        "PR_LAST_MODIFICATION_TIME has type 0x1040, not PT_SYSTIME; ignored",
+    ]
+    assert m.mapi.props["0x00390003"]["value"] == 7
+
+
+def test_correctly_typed_times_are_unaffected():
+    m = to_parsed(note())
+    assert m.date_utc == SUBMIT == m.mapi.client_submit_time
+    assert not [d for d in m.defects if "not PT_SYSTIME" in d]
