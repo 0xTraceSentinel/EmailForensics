@@ -31,7 +31,15 @@ def ingest(
     custodian: Annotated[
         Optional[str], typer.Option("--custodian", "-c", help="Whose mailbox these exports come from.")
     ] = None,
+    progress: Annotated[
+        bool,
+        typer.Option(
+            "--progress/--no-progress",
+            help="Show progress on stderr: a live bar in a terminal, a status line every 15 s when redirected.",
+        ),
+    ] = True,
 ) -> None:
+    from emailforensics.console import make_progress
     from emailforensics.ingest.pipeline import ingest_paths
 
     try:
@@ -40,14 +48,11 @@ def ingest(
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(1)
 
-    summary = ingest_paths(case, inputs, custodian, argv=sys.argv)
-    for f in summary.files:
-        counts = f" {f.messages} messages, {f.attachments} attachments" if f.status == "ingested" else ""
-        if f.item_errors:
-            counts += f", {len(f.item_errors)} unreadable items"
-        typer.echo(f"{f.status:<12}{f.path}{counts}  {f.detail}".rstrip())
-        for e in f.item_errors:
-            typer.echo(f"{'':<12}  {e.item_path}: {e.error}", err=True)
+    reporter = make_progress(progress)
+    try:
+        summary = ingest_paths(case, inputs, custodian, argv=sys.argv, progress=reporter)
+    finally:
+        reporter.close()
 
     ingested = [f for f in summary.files if f.status == "ingested"]
     typer.echo(

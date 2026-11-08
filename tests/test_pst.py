@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from emailforensics.ingest.mapi import NamedProp, decode, to_parsed
-from emailforensics.ingest.pst import _orphans, _Reader, _walk, property_context
+from emailforensics.ingest.pst import _orphans, _Reader, _walk, count_units, property_context
 
 
 def u(s: str) -> bytes:
@@ -144,3 +144,25 @@ def test_orphans_keep_only_message_items():
 
     [entry] = list(_orphans(_Reader({}, "cp1252"), Pst()))
     assert (entry.item_path, entry.folder_path, entry.state) == ("pst:orphan:3000", [], "orphan")
+
+
+def test_progress_units_match_ticks_including_unreadable_and_skipped_orphans():
+    root = Folder(None, 1, folders=[
+        Folder("Inbox", 2, [Item(10, "a"), OSError("bad block")], folders=[Folder("Sub", 3, [Item(11, "b")])]),
+    ])
+
+    class Pst:
+        number_of_orphan_items = 2
+
+        def get_orphan_item(self, i):
+            if i == 0:
+                raise OSError("gone")
+            return Item(12, "c")
+
+    ticks = []
+    reader = _Reader({}, "cp1252", tick=lambda: ticks.append(1))
+    entries = list(_walk(reader, root, [], False)) + list(_orphans(reader, Pst()))
+
+    assert count_units(root, Pst()) == 5
+    assert len(ticks) == 5
+    assert len(entries) == 4

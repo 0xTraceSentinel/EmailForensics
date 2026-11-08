@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import struct
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -94,6 +94,7 @@ class _Reader:
     names: dict[int, NamedProp]
     codepage: str
     seen: set[str] = field(default_factory=set)
+    tick: Callable[[], None] = field(default=lambda: None)
 
     def props(self, record_set, skip: frozenset[int] = frozenset()) -> Props:
         out: Props = {}
@@ -179,9 +180,12 @@ def _walk(reader: _Reader, folder, path: list[str], recoverable: bool) -> Iterat
         try:
             message = folder.get_sub_message(i)
         except OSError as e:
+            reader.tick()
             yield PstEntry(reader.path(f"pst:{folder.identifier}:{i}"), path, state, error=f"OSError: {e}")
             continue
-        yield reader.entry(f"pst:{message.identifier}", path, state, message)
+        entry = reader.entry(f"pst:{message.identifier}", path, state, message)
+        reader.tick()
+        yield entry
     for j in range(folder.number_of_sub_folders):
         try:
             sub = folder.get_sub_folder(j)
@@ -197,13 +201,33 @@ def _orphans(reader: _Reader, pst) -> Iterator[PstEntry]:
         try:
             item = pst.get_orphan_item(i)
             if not item.number_of_record_sets or item.get_record_set(0).get_entry_by_type(PR_MESSAGE_CLASS) is None:
+                reader.tick()
                 continue
         except OSError:
+            reader.tick()
             continue
-        yield reader.entry(f"pst:orphan:{item.identifier}", [], "orphan", item)
+        entry = reader.entry(f"pst:orphan:{item.identifier}", [], "orphan", item)
+        reader.tick()
+        yield entry
 
 
-def read_pst(path: Path) -> Iterator[PstEntry]:
+def count_units(folder, pst=None) -> int:
+    n = folder.number_of_sub_messages
+    for j in range(folder.number_of_sub_folders):
+        try:
+            n += count_units(folder.get_sub_folder(j))
+        except OSError:
+            continue
+    if pst is not None:
+        n += pst.number_of_orphan_items
+    return n
+
+
+def read_pst(
+    path: Path,
+    on_total: Callable[[int], None] | None = None,
+    tick: Callable[[], None] | None = None,
+) -> Iterator[PstEntry]:
     import pypff
 
     with open(path, "rb") as fh:
@@ -212,7 +236,12 @@ def read_pst(path: Path) -> Iterator[PstEntry]:
         try:
             codepage = (pst.ascii_codepage or b"cp1252").decode("ascii", "replace")
             reader = _Reader(_name_map(pst), codepage)
-            yield from _walk(reader, pst.get_root_folder(), [], False)
+            if tick is not None:
+                reader.tick = tick
+            root = pst.get_root_folder()
+            if on_total is not None:
+                on_total(count_units(root, pst))
+            yield from _walk(reader, root, [], False)
             yield from _orphans(reader, pst)
         finally:
             pst.close()
