@@ -138,13 +138,23 @@ class _Reader:
     def message(self, message) -> MapiItem:
         props = self.item_props(message)
         attachments = []
-        if getattr(message, "number_of_attachments", 0):
-            attachments = [self.attachment(a) for a in message.attachments]
+        defects = []
+        for i in range(getattr(message, "number_of_attachments", 0) or 0):
+            try:
+                attachments.append(self.attachment(message.get_attachment(i)))
+            except OSError as e:
+                defects.append(f"attachment {i + 1}: data unreadable by libpff ({e}); properties kept, content missing")
+                try:
+                    att_props = self.item_props(message.get_attachment(i), frozenset({PR_ATTACH_DATA}))
+                except OSError:
+                    att_props = {}
+                attachments.append(MapiAttachment(att_props))
         return MapiItem(
             props=props,
             recipients=self.recipients(message) if hasattr(message, "recipients") else [],
             attachments=attachments,
             codepage=item_codepage(props, self.codepage),
+            defects=defects,
         )
 
     def path(self, base: str) -> str:

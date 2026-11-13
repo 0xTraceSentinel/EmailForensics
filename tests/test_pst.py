@@ -87,6 +87,30 @@ class Item:
     def get_record_set(self, i):
         return RecordSet([Entry(0x001A, 0x001F, u("IPM.Note")), Entry(0x0037, 0x001F, u(self.subject))])
 
+    def get_attachment(self, i):
+        return self.attachments[i]
+
+
+class BrokenAttachment:
+    number_of_record_sets = 1
+
+    def get_record_set(self, i):
+        return RecordSet([Entry(0x3707, 0x001F, u("scan.pdf")), Entry(0x3705, 0x0003, (1).to_bytes(4, "little"))])
+
+    @property
+    def size(self):
+        raise OSError("pypff_attachment_get_size: failed to retrieve data size.")
+
+
+def test_unreadable_attachment_keeps_the_message():
+    item = Item(2097500, "Signed resolution", number_of_attachments=1, attachments=[BrokenAttachment()])
+    entry = _Reader({}, "cp1252").entry("pst:2097500", ["Inbox"], "live", item)
+    assert entry.error is None
+    msg = to_parsed(entry.item)
+    assert msg.subject == "Signed resolution"
+    assert [(a.filename, a.size) for a in msg.attachments] == [("scan.pdf", 0)]
+    assert any("attachment 1: data unreadable" in d for d in msg.defects)
+
 
 @dataclass
 class Folder:

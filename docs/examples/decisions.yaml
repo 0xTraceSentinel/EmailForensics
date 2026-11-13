@@ -1,0 +1,18 @@
+- id: D1
+  title: Acquire Target Ltd for USD 40m
+  formal_date: 2023-06-14
+  formal_place: Ebene board meeting
+  formal_country: MU
+  source: Minutes 2023-06-14, p.3
+  search:
+    terms: ["Target Ltd", "Project Falcon", "SPA"]
+    window: [2023-03-01, 2023-07-31]
+- id: D2
+  title: USD 25m facility with Bank X
+  formal_date: 2023-09-02
+  formal_place: Written resolution
+  formal_country: MU
+  source: Resolution #7
+  search:
+    terms: ["facility agreement", "Bank X", "term sheet"]
+    window: [2023-07-01, 2023-09-30]
