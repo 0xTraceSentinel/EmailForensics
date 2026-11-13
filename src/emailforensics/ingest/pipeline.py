@@ -10,14 +10,25 @@ from emailforensics.case import Case
 from emailforensics.hashing import sha256_bytes, sha256_file
 from emailforensics.ingest.mbox import split_mbox, unescape
 from emailforensics.ingest.parse import parse_message
+from emailforensics.progress import IngestProgress
 from emailforensics.store import db, writer
 
-_EXTENSIONS = {".eml": "eml", ".mbox": "mbox", ".mbx": "mbox"}
-_LATER = {".pst", ".ost", ".msg"}
+_EXTENSIONS = {".eml": "eml", ".mbox": "mbox", ".mbx": "mbox", ".pst": "pst", ".ost": "ost", ".msg": "msg"}
+_CFB_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+BATCH_ITEMS = 500
+BATCH_BYTES = 32 << 20
 
 
 class EvidenceChanged(RuntimeError):
     pass
+
+
+@dataclass
+class ItemError:
+    item_path: str
+    error: str
 
 
 @dataclass
@@ -27,6 +38,7 @@ class FileResult:
     detail: str = ""
     messages: int = 0
     attachments: int = 0
+    item_errors: list[ItemError] = field(default_factory=list)
 
 
 @dataclass
@@ -38,17 +50,24 @@ class IngestSummary:
     def errors(self) -> list[FileResult]:
         return [f for f in self.files if f.status == "error"]
 
+    @property
+    def item_errors(self) -> list[tuple[Path, ItemError]]:
+        return [(f.path, e) for f in self.files for e in f.item_errors]
+
 
 def detect_format(path: Path, explicit: bool) -> str | None:
     ext = path.suffix.lower()
     if ext in _EXTENSIONS:
         return _EXTENSIONS[ext]
-    if ext in _LATER:
-        return None
     with open(path, "rb") as f:
-        if f.read(5) == b"From ":
-            return "mbox"
-    return "eml" if explicit else None
+        head = f.read(8)
+    if head[:5] == b"From ":
+        return "mbox"
+    if head[:4] == b"!BDN":
+        return "pst"
+    if explicit:
+        return "msg" if head == _CFB_SIGNATURE else "eml"
+    return None
 
 
 def expand_inputs(inputs: list[str]) -> list[tuple[Path, bool]]:
@@ -68,56 +87,174 @@ def expand_inputs(inputs: list[str]) -> list[tuple[Path, bool]]:
     return sorted(found.items(), key=lambda kv: str(kv[0]))
 
 
-def _ingest_file(conn, case: Case, run_id: int, path: Path, fmt: str, custodian: str | None) -> FileResult:
-    sha_before = sha256_file(path)
+class _Batch:
+    def __init__(self, conn, blobs, source_id: int, result: FileResult, isolate: bool) -> None:
+        self.conn, self.blobs, self.source_id, self.result, self.isolate = conn, blobs, source_id, result, isolate
+        self.items: list[tuple[int, writer.NewMessage]] = []
+        self.size = 0
+        self.errors: list[tuple[int, ItemError]] = []
+
+    def add(self, item: writer.NewMessage, seq: int = 0) -> None:
+        self.items.append((seq, item))
+        self.size += writer.payload_bytes(item.msg)
+        if len(self.items) >= BATCH_ITEMS or self.size >= BATCH_BYTES:
+            self.flush()
+
+    def error(self, seq: int, item_path: str, error: str) -> None:
+        self.errors.append((seq, ItemError(item_path, error)))
+
+    def flush(self) -> None:
+        pending, self.items, self.size = self.items, [], 0
+        if not pending:
+            return
+        items = [item for _, item in pending]
+        if not self.isolate:
+            self._count(writer.insert_messages(self.conn, self.blobs, self.source_id, items))
+            return
+        try:
+            with self.conn.transaction():
+                counts = writer.insert_messages(self.conn, self.blobs, self.source_id, items)
+        except Exception:
+            for seq, item in pending:
+                try:
+                    with self.conn.transaction():
+                        counts = writer.insert_messages(self.conn, self.blobs, self.source_id, [item])
+                except Exception as e:
+                    self.error(seq, item.item_path, f"{type(e).__name__}: {e}")
+                    continue
+                self._count(counts)
+            return
+        self._count(counts)
+
+    def finish(self) -> None:
+        self.flush()
+        self.result.item_errors.extend(e for _, e in sorted(self.errors, key=lambda se: se[0]))
+        self.errors = []
+
+    def _count(self, counts: tuple[int, int]) -> None:
+        self.result.messages += counts[0]
+        self.result.attachments += counts[1]
+
+
+def _ingest_pst(conn, blobs, source_id: int, path: Path, result: FileResult, progress: IngestProgress) -> None:
+    from emailforensics.ingest.mapi import to_parsed
+    from emailforensics.ingest.pst import read_pst
+
+    done = 0
+
+    def tick() -> None:
+        nonlocal done
+        done += 1
+        progress.update(done)
+
+    progress.stage("opening", None)
+    batch = _Batch(conn, blobs, source_id, result, isolate=True)
+    entries = read_pst(path, on_total=lambda total: progress.stage("items", total), tick=tick)
+    for seq, entry in enumerate(entries):
+        if entry.error is not None:
+            batch.error(seq, entry.item_path, entry.error)
+            continue
+        try:
+            msg = to_parsed(entry.item)
+        except Exception as e:
+            batch.error(seq, entry.item_path, f"{type(e).__name__}: {e}")
+            continue
+        new = writer.NewMessage(entry.item_path, msg.sha256, msg, folder_path=entry.folder_path, item_state=entry.state)
+        batch.add(new, seq)
+    batch.finish()
+
+
+def _ingest_msg(conn, blobs, source_id: int, path: Path, result: FileResult) -> None:
+    from emailforensics.ingest.mapi import to_parsed
+    from emailforensics.ingest.msg import read_msg
+
+    msg = to_parsed(read_msg(path))
+    result.messages, result.attachments = writer.insert_message(conn, blobs, source_id, "msg", msg.sha256, msg)
+
+
+def _ingest_file(
+    conn, case: Case, run_id: int, path: Path, fmt: str, custodian: str | None, progress: IngestProgress
+) -> FileResult:
+    size = path.stat().st_size
+    progress.stage("hashing", size, "bytes")
+    sha_before = sha256_file(path, progress.update)
     if writer.source_exists(conn, sha_before):
         return FileResult(path, "skipped", f"already ingested (sha256 {sha_before[:12]})")
 
     blobs = case.blobs
-    n_msgs = n_atts = 0
+    result = FileResult(path, "ingested", f"sha256 {sha_before[:12]}")
     with conn.transaction():
         source_id = writer.insert_source(conn, run_id, path, fmt, sha_before, custodian)
         if fmt == "eml":
             raw = path.read_bytes()
-            m, a = writer.insert_message(
+            result.messages, result.attachments = writer.insert_message(
                 conn, blobs, source_id, "eml", sha_before, parse_message(raw), byte_offset=0, byte_length=len(raw)
             )
-            n_msgs, n_atts = m, a
-        elif path.stat().st_size:
+        elif fmt in ("pst", "ost"):
+            _ingest_pst(conn, blobs, source_id, path, result, progress)
+        elif fmt == "msg":
+            progress.stage("reading", None)
+            _ingest_msg(conn, blobs, source_id, path, result)
+        elif size:
+            progress.stage("scanning", None)
+            batch = _Batch(conn, blobs, source_id, result, isolate=False)
             with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
                 for entry in split_mbox(data):
-                    m, a = writer.insert_message(
-                        conn, blobs, source_id, f"mbox:{entry.index}", sha256_bytes(entry.raw),
-                        parse_message(unescape(entry.raw)),
+                    if entry.index == 0:
+                        progress.stage("messages", size, "bytes")
+                    batch.add(writer.NewMessage(
+                        f"mbox:{entry.index}", sha256_bytes(entry.raw), parse_message(unescape(entry.raw)),
                         byte_offset=entry.offset, byte_length=len(entry.raw), envelope_from=entry.envelope,
-                    )
-                    n_msgs += m
-                    n_atts += a
+                    ))
+                    progress.update(entry.offset + len(entry.raw))
+                batch.finish()
 
-        sha_after = sha256_file(path)
+        progress.stage("verifying hash", size, "bytes")
+        sha_after = sha256_file(path, progress.update)
         if sha_after != sha_before:
             raise EvidenceChanged(f"{path} changed while being read ({sha_before} -> {sha_after})")
 
-    return FileResult(path, "ingested", f"sha256 {sha_before[:12]}", n_msgs, n_atts)
+    return result
 
 
-def ingest_paths(case: Case, inputs: list[str], custodian: str | None, argv: list[str]) -> IngestSummary:
+def _record(summary: IngestSummary, progress: IngestProgress, result: FileResult) -> None:
+    summary.files.append(result)
+    progress.end_file(result)
+
+
+def ingest_paths(
+    case: Case,
+    inputs: list[str],
+    custodian: str | None,
+    argv: list[str],
+    progress: IngestProgress | None = None,
+) -> IngestSummary:
+    progress = progress or IngestProgress()
     with db.connect(case.dsn) as conn:
         db.migrate(conn)
         summary = IngestSummary(run_id=writer.start_run(conn, __version__, argv, custodian))
+        todo: list[tuple[Path, str]] = []
         for path, explicit in expand_inputs(inputs):
             try:
                 fmt = detect_format(path, explicit)
-                if fmt is None:
-                    if explicit or path.suffix.lower() in _LATER:
-                        summary.files.append(FileResult(path, "unsupported", "format not supported yet"))
-                    continue
-                summary.files.append(_ingest_file(conn, case, summary.run_id, path, fmt, custodian))
             except Exception as e:
-                summary.files.append(FileResult(path, "error", f"{type(e).__name__}: {e}"))
+                _record(summary, progress, FileResult(path, "error", f"{type(e).__name__}: {e}"))
+                continue
+            if fmt is not None:
+                todo.append((path, fmt))
+            elif explicit:
+                _record(summary, progress, FileResult(path, "unsupported", "format not recognised"))
+        for number, (path, fmt) in enumerate(todo, 1):
+            progress.begin_file(path, number, len(todo))
+            try:
+                result = _ingest_file(conn, case, summary.run_id, path, fmt, custodian, progress)
+            except Exception as e:
+                result = FileResult(path, "error", f"{type(e).__name__}: {e}")
+            _record(summary, progress, result)
         writer.finish_run(
             conn,
             summary.run_id,
-            [{"path": str(f.path.resolve()), "error": f.detail} for f in summary.errors],
+            [{"path": str(f.path.resolve()), "error": f.detail} for f in summary.errors]
+            + [{"path": str(p.resolve()), "item": e.item_path, "error": e.error} for p, e in summary.item_errors],
         )
     return summary

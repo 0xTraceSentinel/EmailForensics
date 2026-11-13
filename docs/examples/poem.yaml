@@ -1,0 +1,15 @@
+places:
+  ZA:
+    ip_ranges: []
+    entities: ["Group (Pty) Ltd", "GROUP-ZA"]
+  MU:
+    ip_ranges: []
+    entities: ["OffshoreCo Ltd", "Management Co (Mauritius)"]
+privilege_domains: ["@lawfirm.co.za", "@counsel.mu"]
+extra_phrases:
+  instruction: ["sort it out"]
+  formality: ["as discussed in sandton"]
+sendtime:
+  min_days: 3
+  tolerance_min: 45
+excluded_folders: ["Junk Email", "RSS Feeds", "Sync Issues"]

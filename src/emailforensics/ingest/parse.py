@@ -34,6 +34,7 @@ class Attachment:
     content_id: str | None
     data: bytes = field(repr=False)
     sha256: str = field(init=False)
+    mapi_props: dict | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.sha256 = sha256_bytes(self.data)
@@ -41,6 +42,21 @@ class Attachment:
     @property
     def size(self) -> int:
         return len(self.data)
+
+
+@dataclass
+class MapiFields:
+    message_class: str | None
+    client_submit_time: datetime | None
+    delivery_time: datetime | None
+    creation_time: datetime | None
+    last_modification_time: datetime | None
+    last_modifier_name: str | None
+    sent_representing: list[dict]
+    conversation_index: bytes | None
+    conversation_topic: str | None
+    recipients: list[dict]
+    props: dict = field(repr=False)
 
 
 @dataclass
@@ -65,6 +81,7 @@ class ParsedMessage:
     defects: list[str]
     attachments: list[Attachment]
     children: list[tuple[str, ParsedMessage]]
+    mapi: MapiFields | None = None
 
 
 def _unfold(v: str | None) -> str | None:
@@ -98,7 +115,7 @@ def _addresses(headers: list[tuple[str, str]], name: str) -> list[dict]:
     ]
 
 
-def _msgids(v: str | None) -> list[str]:
+def msgids(v: str | None) -> list[str]:
     return _MSGID.findall(v) if v else []
 
 
@@ -192,15 +209,15 @@ def parse_message(raw: bytes) -> ParsedMessage:
     children: list[tuple[str, ParsedMessage]] = []
     _walk(msg, "", attachments, children, defects)
 
-    msgid = _msgids(_first_raw(headers, "Message-ID"))
-    in_reply_to = _msgids(_first_raw(headers, "In-Reply-To"))
+    msgid = msgids(_first_raw(headers, "Message-ID"))
+    in_reply_to = msgids(_first_raw(headers, "In-Reply-To"))
 
     return ParsedMessage(
         sha256=sha256_bytes(raw),
         headers=headers,
         rfc_message_id=msgid[0] if msgid else clean(_first_raw(headers, "Message-ID")),
         in_reply_to=in_reply_to[0] if in_reply_to else None,
-        references=_msgids(_first_raw(headers, "References")),
+        references=msgids(_first_raw(headers, "References")),
         subject=clean(_decode(_first_raw(headers, "Subject"))),
         from_addr=_addresses(headers, "From"),
         sender_addr=_addresses(headers, "Sender"),

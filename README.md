@@ -10,7 +10,7 @@ The tool doesn't give a verdict. It turns a pile of exported email into **eviden
 
 > Background on the legal test and the investigative method: [`docs/methodology.md`](docs/methodology.md)
 
-> Status: M1 (EML/MBOX ingest) in progress. `init` and `ingest` exist; everything else below is design.
+> Status: ingest (EML/MBOX/PST/OST/MSG) and the single-mailbox analysis pipeline (`people`, `register`, `analyze`, `timeline`, `report`) are in place. Network analysis across several custodians is still design.
 
 ## Getting started
 
@@ -20,7 +20,13 @@ python -m venv .venv && . .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 
 emailforensics init cases/case01
+emailforensics ingest cases/case01 exports/cfo.pst --custodian cfo
 emailforensics ingest cases/case01 exports/ --custodian cfo
+emailforensics people cases/case01 docs/examples/people.yaml
+emailforensics register cases/case01 docs/examples/decisions.yaml
+emailforensics analyze cases/case01 --config docs/examples/poem.yaml
+emailforensics timeline cases/case01 D1
+emailforensics report cases/case01 --out report/ --config docs/examples/poem.yaml
 ```
 
 The server connection comes from `EMAILFORENSICS_DSN` (default: the Docker Compose credentials). Each case gets its own database (`ef_<case name>`), with attachment bytes stored content-addressed under `<case>/blobs/`.
@@ -29,9 +35,40 @@ What ingest records for M1:
 - **Source files:** absolute path, size and SHA-256, hashed before and after reading. If the hash changes, that file's import is rolled back. A file already ingested (same hash) is skipped.
 - **Messages:** item path inside the source (`eml`, `mbox:12`, `mbox:12/rfc822:2` for embedded messages), byte offset and length, SHA-256 of the stored bytes, all raw headers in order, `Date` as UTC **plus the original offset** (`NULL` for `-0000`), addresses, threading IDs, bodies, parse defects, and full-text search over subject and body.
 - **Attachments:** MIME part number, filename, type, size and SHA-256.
-- **Ingest runs:** tool version, command line, custodian and any per-file errors.
+- **Ingest runs:** tool version, command line, custodian, per-file errors and per-item errors.
 
-Tests: `pytest`. The database test runs only when `EMAILFORENSICS_TEST_DSN` is set, e.g. `postgresql://emailforensics:emailforensics@localhost:5432/postgres`.
+What ingest adds for PST/OST and MSG (M2):
+- **Item paths:** `pst:<node id>` for items in the folder tree, `pst:orphan:<node id>` for orphaned items libpff finds outside it, `msg` for a `.msg` file, and `/att:<n>` for embedded messages.
+- **Folders:** `folder_path` as an array (`{Top of Information Store,Inbox}`), and `item_state`: `live`, `recoverable` (anywhere under a `Recoverable Items` folder: Deletions, Purges, Versions, DiscoveryHolds) or `orphan`.
+- **MAPI properties:** every property of the item and of each attachment in `mapi_props` (keyed by tag, e.g. `0x00390040`, or by property set and name for named properties), the recipient table in `mapi_recipients`, and dedicated columns for `message_class`, `client_submit_time`, `delivery_time`, `creation_time`, `last_modification_time`, `last_modifier_name`, `sent_representing` (sent-on-behalf-of), `conversation_index` (raw `Thread-Index`) and `conversation_topic`.
+- **Headers and dates:** `PR_TRANSPORT_MESSAGE_HEADERS` is parsed like an EML header block, so received mail keeps its `Date` offset. Items without transport headers (sent items, drafts) take `date_utc` from `PR_CLIENT_SUBMIT_TIME` or `PR_MESSAGE_DELIVERY_TIME`, with no offset and a parse defect saying so.
+- **Hashes:** PST/MSG items have no raw bytes, so `sha256` is over a canonical serialisation of the item's MAPI properties, recipients and attachments (`hash_basis = 'mapi'`). Named properties are keyed by property set and name, not the file-local ID, so the hash doesn't depend on the store's name-to-ID map.
+- **Unreadable items** are recorded per item in the run's errors without rolling back the rest of the PST; the command exits non-zero.
+
+Known PST limits (libpff): an embedded message (e.g. "forward as attachment") is decoded from its own property heap only. Its subject, sender, times, IDs and small bodies are read, but its recipients, its own attachments, and any property stored in a sub-node (roughly >3.5 KB, such as long bodies) are not. Each case is flagged in `parse_defects`. Bodies stored only as compressed RTF are flagged and not yet decoded.
+
+### What `analyze` derives from one mailbox
+
+`analyze` recomputes everything from the stored messages each run (results are replaced, the run and its config hash are recorded in `analysis_run`). Places, offsets, airports, IP ranges, entity names and phrase lists come from `--config` (defaults: South Africa `+0200` vs Mauritius `+0400`; see `docs/examples/poem.yaml`).
+
+| Signal | How it is obtained | Strength |
+|---|---|---|
+| `Date` offset on the item | Transport headers | weak (desktop) / moderate (mobile client) |
+| Offset for sent items without headers | Another copy of the same `Message-ID` in the mailbox (cc to self, distribution lists, forwards as attachment) | as above |
+| Replier's client time zone | The quoted `Sent:` / `On … wrote:` line compared with the parent message's UTC time (or the Thread-Index time of the parent), English and French formats | weak |
+| Send-time pattern | Weekly median first send in UTC vs the mailbox baseline; a ~2h earlier shift matches Mauritius | weak, aggregate |
+| Self-statements | "landed in Mauritius", "back in Joburg", "flying to …" in the sender's own text (quoted history is stripped) | moderate / weak |
+| Calendar items | Location text and the time-zone definition stored on appointments; online meetings excluded from location | moderate / weak |
+| Travel and receipts | Itineraries (airport pairs with dates), ride receipts, out-of-office replies | weak / moderate, always queued for verification |
+| Client IPs | `X-Originating-IP`, first `Received` hop; placed only via configured IP ranges, otherwise queued for historical geolocation | moderate when placed |
+| Documents | OOXML core/app properties, tracked-change and comment authors, Word `dateUtc` vs local revision time (editor's time zone), OLE summary info, PDF Info/XMP dates with offsets, e-signature certificates and IPs | weak / per document |
+| Language | Instruction, approval, formality, POEM-awareness, channel-shift, deliberation and privilege phrase lists on authored text only | lead for review |
+| Threads | Message-ID/References plus Outlook Thread-Index; missing thread ancestors are reported with their original time | anomaly |
+| Anomalies | Weeks with no sent mail, Recoverable Items on decision threads, decision documents created before/after the formal date, conflicting location signals | anomaly |
+
+The report (`report/index.html` plus `report/csv/*.csv`) has, per decision, an indicator matrix (counts by home base and by inferred location, never a verdict), a timeline with source path and hash for every row, document metadata and anomalies. It also has the custodian's location calendar, coverage statistics showing how much the mailbox can actually say, and a human review queue (`csv/review_queue.csv`, with empty `reviewer`/`outcome` columns).
+
+Tests: `pytest`. The database tests run only when `EMAILFORENSICS_TEST_DSN` is set, e.g. `postgresql://emailforensics:emailforensics@127.0.0.1:5432/postgres`.
 
 ---
 
@@ -106,7 +143,7 @@ Keywords and phrase lists are one input to step 2 and to the language analyzer. 
 | `anomalies` | Volume gaps, missing thread parents, deleted items, documents created after their stated date (backdating). |
 | `report` | HTML/CSV per decision: indicator matrix, timeline, and exhibits linked to source hashes. |
 
-### Planned CLI
+### CLI
 
 ```bash
 emailforensics init  case01/                         # create case folder + PostgreSQL database
@@ -149,8 +186,8 @@ Example `decisions.yaml`:
 | Need | Option |
 |---|---|
 | Language | Python 3.11+ |
-| PST/OST | `libpff` (`pypff` bindings); `readpst` (libpst) as a fallback converter |
-| MSG | `extract-msg` |
+| PST/OST | `libpff` (`libpff-python` bindings) |
+| MSG | `olefile` (compound file) + the shared MAPI property mapper |
 | EML / MBOX | stdlib `email`, `mailbox` |
 | OOXML metadata | stdlib `zipfile` + `xml.etree` |
 | PDF metadata | `pikepdf` |
@@ -164,14 +201,14 @@ Example `decisions.yaml`:
 
 ## Roadmap
 
-- [ ] **M1 – Ingest:** EML/MBOX → PostgreSQL with hashing and provenance
-- [ ] **M2 – PST/MSG:** MAPI properties, folder paths, Recoverable Items
-- [ ] **M3 – Headers + threading:** time zone offsets, client info, `Thread-Index` decoding
-- [ ] **M4 – Attachments:** OOXML, PDF XMP, e-signature audit trail parsing
-- [ ] **M5 – Decision register + timeline:** per-decision timelines and CSV export
-- [ ] **M6 – Presence + language:** travel extraction, instruction/approval classification
-- [ ] **M7 – Network + anomalies:** centrality, exclusion, gaps, backdating
-- [ ] **M8 – Reporting:** HTML indicator matrix with exhibits
+- [x] **M1 – Ingest:** EML/MBOX → PostgreSQL with hashing and provenance
+- [x] **M2 – PST/MSG:** MAPI properties, folder paths, Recoverable Items
+- [x] **M3 – Headers + threading:** time zone offsets (direct, from copies, from quoted reply headers), client info, `Thread-Index` decoding
+- [x] **M4 – Attachments:** OOXML, OLE, PDF Info/XMP, e-signature audit trail detection
+- [x] **M5 – Decision register + timeline:** per-decision timelines and CSV export
+- [x] **M6 – Presence + language:** calendar, travel, receipts, self-statements, self-calibrating send-time pattern, phrase classification
+- [ ] **M7 – Network + anomalies:** anomalies done (missing thread ancestors, gaps, Recoverable Items, document timing, location conflicts); network analysis (centrality, exclusion of offshore directors) needs several custodians and is not built
+- [x] **M8 – Reporting:** HTML indicator matrix with exhibits, review queue
 
 ---
 

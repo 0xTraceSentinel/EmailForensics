@@ -1,0 +1,23 @@
+custodian: exec
+people:
+  - id: exec
+    name: Jane Executive
+    names: ["Executive, Jane", "Jane E"]
+    addresses:
+      - jane@group.co.za
+      - jane@offshoreco.mu
+      - /o=exchangelabs/ou=exchange administrative group (fydibohf23spdlt)/cn=recipients/cn=jane
+    base: ZA
+    role: Executive director
+    board: true
+  - id: md
+    name: Mauritian Director
+    addresses: [director@offshoreco.mu]
+    base: MU
+    role: Resident director
+    board: true
+  - id: cosec
+    name: Company Secretary
+    addresses: [cosec@managementco.mu]
+    base: MU
+    role: Company secretary (management company)

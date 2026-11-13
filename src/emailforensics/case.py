@@ -14,7 +14,7 @@ from emailforensics.blobs import BlobStore
 from emailforensics.store import db
 
 CASE_FILE = "case.json"
-DEFAULT_DSN = "postgresql://emailforensics:emailforensics@localhost:5432/postgres"
+DEFAULT_DSN = "postgresql://emailforensics:emailforensics@127.0.0.1:5432/postgres"
 
 
 def server_dsn() -> str:
