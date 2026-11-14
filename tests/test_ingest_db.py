@@ -140,7 +140,7 @@ def test_pst_batches_isolate_bad_items_and_keep_error_order(case, tmp_path, monk
     monkeypatch.setattr(pipeline, "BATCH_ITEMS", 4)
     monkeypatch.setattr(writer, "_MAX_PARAMS", 100)
 
-    def fake_read_pst(path, on_total=None, tick=None):
+    def fake_read_pst(path, on_total=None, tick=None, skip=0):
         for i in range(9):
             if i == 6:
                 yield pst.PstEntry(f"pst:{i}", ["Inbox"], "live", error="OSError: bad block")
@@ -181,3 +181,45 @@ def test_pst_batches_isolate_bad_items_and_keep_error_order(case, tmp_path, monk
         assert f.attachments == conn.execute("SELECT count(*) FROM attachment").fetchone()[0] == 12
         shas = [r[0] for r in conn.execute("SELECT sha256 FROM message WHERE item_path = 'pst:1'")]
         assert shas == ["123e820ca324ad46048f960de55ecc9ffa3de4e6886bf255372c785891b83ac8"]
+
+
+def test_interrupted_mbox_ingest_resumes_without_duplicates(case, evidence, monkeypatch):
+    from emailforensics.ingest import pipeline
+    from emailforensics.memory import MemoryPressure
+    from emailforensics.store import writer
+
+    mbox = evidence / "sample.mbox"
+    monkeypatch.setattr(pipeline, "BATCH_ITEMS", 1)
+    real = writer.insert_messages
+    calls = []
+
+    def flaky(conn, blobs, source_id, items):
+        calls.append(1)
+        if len(calls) == 2:
+            raise MemoryPressure("test")
+        return real(conn, blobs, source_id, items)
+
+    monkeypatch.setattr(writer, "insert_messages", flaky)
+    with pytest.raises(MemoryPressure):
+        ingest_paths(case, [str(mbox)], custodian="cfo", argv=["test"])
+    with db.connect(case.dsn) as conn:
+        status, done = conn.execute("SELECT status, items_done FROM source_file").fetchone()
+        assert (status, done) == ("in_progress", 1)
+        assert conn.execute("SELECT status FROM ingest_run").fetchone()[0] == "interrupted"
+        assert conn.execute("SELECT count(*) FROM message WHERE parent_id IS NULL").fetchone()[0] == 1
+        conn.execute("UPDATE ingest_run SET status = 'running', finished_at = NULL")
+
+    monkeypatch.setattr(writer, "insert_messages", real)
+    with db.connect(case.dsn) as conn, pytest.raises(ValueError, match="custodian 'cfo'"):
+        pipeline._ingest_file(conn, case, 0, mbox, "mbox", "someone-else", IngestProgress())
+    summary = ingest_paths(case, [str(mbox)], custodian="cfo", argv=["test"])
+    [f] = summary.files
+    assert f.status == "ingested" and "resumed after 1 items" in f.detail
+    with db.connect(case.dsn) as conn:
+        assert conn.execute("SELECT status, cardinality(resumed_runs) FROM source_file").fetchone() == ("complete", 1)
+        assert conn.execute("SELECT count(*) FROM ingest_run WHERE status = 'running'").fetchone()[0] == 0
+        top = [r[0] for r in conn.execute("SELECT item_path FROM message WHERE parent_id IS NULL ORDER BY id")]
+    clean = ingest_paths(case, [str(mbox)], custodian="cfo", argv=["test"])
+    assert clean.files[0].status == "skipped"
+    from emailforensics.ingest.mbox import split_mbox
+    assert top == [f"mbox:{e.index}" for e in split_mbox(mbox.read_bytes())]

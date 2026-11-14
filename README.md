@@ -32,7 +32,7 @@ emailforensics groundtruth cases/groundtruth docs/examples/truth.yaml   # score 
 
 The server connection comes from `EMAILFORENSICS_DSN` (default: the Docker Compose credentials). Each case gets its own database (`ef_<case name>`), with attachment bytes stored content-addressed under `<case>/blobs/`.
 
-### Machines with 16 GB of RAM
+### Machines with 16 GB of RAM or less
 
 Measured on a 13 GB PST (33,000 items): `ingest` peaks at about 430 MB, `analyze` at about 430 MB, the database is 1.3 GB. `analyze` keeps a small summary of every message in memory, so a mailbox ten times larger needs a few GB. The larger cost on Windows is Docker's WSL 2 virtual machine, which by default may take up to half of the RAM and keeps it as file cache. Cap it in `%UserProfile%\.wslconfig`, then run `wsl --shutdown` and restart Docker Desktop:
 
@@ -46,6 +46,17 @@ autoMemoryReclaim=gradual
 ```
 
 Close other large applications during `analyze`, and keep the case folder on a local SSD rather than a network or USB drive.
+
+Windows can run out of memory while Task Manager still shows free RAM: every program's reserved memory counts against the **commit limit** (RAM plus page file), and when that is used up allocations fail and programs crash. Check it in Task Manager → Performance → Memory → "Committed" (for example `33.5/35.0 GB`). With a small page file, raise it: System → About → Advanced system settings → Performance → Settings → Advanced → Virtual memory, and either let Windows manage it on a drive with free space or set it to at least the size of the RAM (16 GB on a 16 GB machine).
+
+### Interrupted runs resume
+
+Both long commands save their progress as they go, so a crash, a killed process, a lost database connection or a reboot costs at most the last batch:
+
+- **`ingest`** commits PST/OST and MBOX items in batches together with a checkpoint (`source_file.status = 'in_progress'`, `items_done`, `item_errors`). Running the same command again re-hashes the file, confirms it is the same evidence, skips the items already stored and carries on. The file is marked `complete` only after the closing hash check; if the hash changed, everything stored from it is removed. A resume must use the same `--custodian`.
+- **`analyze`** stores each analysed message and attachment in `analysis_checkpoint`, keyed by tool version, config, registers and mailbox contents. Running it again with nothing changed reuses them; changing any of those starts afresh. The previous results stay in place until the new ones are written in a single transaction, so a report never sees half a run.
+
+The memory guard watches free memory and the Windows commit limit. Below twice `--min-free-mb` (default 1024 MB, or `EMAILFORENSICS_MIN_FREE_MB`) it shrinks batches and pages; below `--min-free-mb` for 60 seconds it stops cleanly with exit code 3 and the message to run the command again. In `analyze`, a document too large to read safely with the memory available is skipped and listed for review (`attachment_skipped_low_memory`). `--min-free-mb 0` turns the guard off.
 
 What ingest records for M1:
 - **Source files:** absolute path, size and SHA-256, hashed before and after reading. If the hash changes, that file's import is rolled back. A file already ingested (same hash) is skipped.

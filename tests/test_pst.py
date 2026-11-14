@@ -158,6 +158,23 @@ def test_walk_records_folder_paths_and_recoverable_items():
     assert entries[3].error == "OSError: bad block"
 
 
+def test_walk_resumes_after_skipped_items_with_identical_paths():
+    def tree():
+        return Folder(None, 1, folders=[
+            Folder("Inbox", 2, [Item(10, "a"), Item(10, "dup"), OSError("bad block"), Item(11, "b")],
+                   folders=[Folder("Sub", 3, [Item(12, "c"), Item(13, "d")])]),
+        ])
+
+    full = list(_walk(_Reader({}, "cp1252"), tree(), [], False))
+    for skip in range(len(full) + 1):
+        ticks = []
+        reader = _Reader({}, "cp1252", tick=lambda: ticks.append(1), skip=skip)
+        rest = list(_walk(reader, tree(), [], False))
+        assert [(e.item_path, e.seq, e.error) for e in rest] == [(e.item_path, e.seq, e.error) for e in full[skip:]]
+        assert len(ticks) == len(full)
+    assert [e.seq for e in full] == list(range(len(full)))
+
+
 def test_orphans_keep_only_message_items():
     class Pst:
         items = [Item(3000, "Orphaned reply")]

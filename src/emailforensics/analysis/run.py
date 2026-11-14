@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
@@ -14,10 +16,14 @@ from emailforensics import __version__
 from emailforensics.analysis import clients, docmeta, metadata, sendtime, text, zones
 from emailforensics.analysis.config import Decision, Person, Settings
 from emailforensics.case import Case
+from emailforensics.memory import NO_GUARD, Guard, MemoryPressure
 from emailforensics.store import db
 
 PAGE = 250
+LOW_MEMORY_PAGE = 50
 WRITE_CHUNK = 2000
+DOC_CHECKPOINT = 200
+INTERRUPTIONS = (MemoryPressure, MemoryError, psycopg.OperationalError)
 SENT_FOLDERS = re.compile(r"^(sent items|sent mail|sent|éléments envoyés|elements envoyes|messages envoyés|gesendete elemente)$", re.I)
 DRAFT_FOLDERS = re.compile(r"^(drafts|brouillons|entwürfe)$", re.I)
 DOC_NAMES = re.compile(r"minute|resolution|r[ée]solution|board|consent|proc[eè]s[- ]verbal|pv\b|written|agreement|term ?sheet|spa\b", re.I)
@@ -130,7 +136,10 @@ class Analyzer:
         self.sendtime_calibration: dict[str, dict] = {}
         self.term_patterns: dict[str, re.Pattern] = {}
         self.writer_profiles: dict[str, dict] = {}
-        self.authored_pending: list[int] = []
+        self.run_key = ""
+        self.guard: Guard = NO_GUARD
+        self.attachment_rows: list[tuple] = []
+        self.resumed = {"message": 0, "doc": 0}
 
     def load_registers(self) -> None:
         for pid, name, names, base, role, board, custodian in self.conn.execute(
@@ -226,37 +235,72 @@ class Analyzer:
             return True
         return bool(folders) and SENT_FOLDERS.match(folders[-1]) is not None
 
+    def _checkpoints(self, scope: str):
+        order = "item::bigint" if scope == "message" else "item"
+        with self.conn.transaction(), self.conn.cursor(name=f"checkpoint_{scope}") as cur:
+            cur.itersize = 2000
+            cur.execute(f"SELECT item, data FROM analysis_checkpoint WHERE run_key = %s AND scope = %s ORDER BY {order}",
+                        (self.run_key, scope))
+            yield from cur
+
+    def _save(self, scope: str, rows: list[tuple[str, dict, str | None]]) -> None:
+        if not rows:
+            return
+        with self.conn.cursor() as cur, cur.copy(
+            "COPY analysis_checkpoint (run_key, scope, item, data, authored_text) FROM STDIN"
+        ) as cp:
+            for item, data, authored in rows:
+                cp.write_row((self.run_key, scope, item, json.dumps(_json(data)), _json(authored) if authored is not None else None))
+
+    def _captured(self, e0: int, v0: int) -> dict:
+        return {"evidence": [_dump_evidence(e) for e in self.evidence[e0:]], "reviews": self.reviews[v0:]}
+
+    def _restore_side_effects(self, data: dict) -> None:
+        self.evidence.extend(_load_evidence(e) for e in data["evidence"])
+        self.reviews.extend(data["reviews"])
+
     def message_pass(self) -> None:
         last = 0
-        done = 0
         quoted_jobs: list[int] = []
-        self.conn.execute("CREATE TEMP TABLE analysis_authored (msg_id bigint PRIMARY KEY, authored_text text) ON COMMIT DROP")
+        for item, data in self._checkpoints("message"):
+            mid = int(item)
+            r = _load_result(data["result"])
+            self.results[mid] = r
+            if data.get("terms"):
+                self.term_hits[mid].update(data["terms"])
+            if r.quoted_sent:
+                quoted_jobs.append(mid)
+            self._restore_side_effects(data)
+            last = max(last, mid)
+            self.resumed["message"] += 1
+        if self.resumed["message"]:
+            self.log(f"resuming: {self.resumed['message']:,} messages already analysed")
+        page = PAGE
+        done = self.resumed["message"]
         while True:
             rows = self.conn.execute(
                 "SELECT id, body_text, body_html, headers, mapi_props FROM message WHERE id > %s ORDER BY id LIMIT %s",
-                (last, PAGE),
+                (last, page),
             ).fetchall()
             if not rows:
                 break
+            saved = []
             for mid, body_text, body_html, headers, props in rows:
                 last = mid
+                e0, v0 = len(self.evidence), len(self.reviews)
                 self._one(self.lite[mid], body_text, body_html, headers or [], props, quoted_jobs)
+                r = self.results[mid]
+                data = {"result": _dump_result(r), "terms": sorted(self.term_hits.get(mid, ())), **self._captured(e0, v0)}
+                saved.append((str(mid), data, r.authored_text))
+                r.authored_text = None
+                self.guard.check()
+            done += len(rows)
             del rows
-            self._stash_authored()
-            done = len(self.results)
+            self._save("message", saved)
+            del saved
+            page = LOW_MEMORY_PAGE if self.guard.check() else PAGE
             self.log(f"messages analysed: {done:,}/{len(self.lite):,}")
         self.quoted_jobs = quoted_jobs
-
-    def _stash_authored(self) -> None:
-        pending = [(mid, _json(self.results[mid].authored_text)) for mid in self.authored_pending if self.results[mid].authored_text is not None]
-        self.authored_pending = []
-        if not pending:
-            return
-        with self.conn.cursor() as cur, cur.copy("COPY analysis_authored (msg_id, authored_text) FROM STDIN") as cp:
-            for row in pending:
-                cp.write_row(row)
-        for mid, _ in pending:
-            self.results[mid].authored_text = None
 
     def _one(self, m: Lite, body_text, body_html, headers: list[dict], props: dict | None, quoted_jobs: list[int]) -> None:
         r = self.results.setdefault(m.id, Result(m.id))
@@ -274,7 +318,6 @@ class Analyzer:
         q = text.split_quoted(full)
         authored = text.strip_boilerplate(q.authored)
         r.authored_text = authored[:20000]
-        self.authored_pending.append(m.id)
         r.quoted_sent = q.sent_value
         if q.sent_value:
             quoted_jobs.append(m.id)
@@ -704,70 +747,110 @@ class Analyzer:
             "SELECT DISTINCT ON (sha256) sha256, filename, content_type, size_bytes FROM attachment ORDER BY sha256"
         ).fetchall()
         terms = {d.id: [t.lower() for t in d.terms] for d in self.decisions}
-        inserted = 0
+        done: dict[str, dict] = {}
+        for sha, data in self._checkpoints("doc"):
+            done[sha] = data
+        if done:
+            self.resumed["doc"] = len(done)
+            self.log(f"resuming: {len(done):,} attachments already analysed")
+        saved: list[tuple[str, dict, None]] = []
         for i, (sha, filename, ctype, size) in enumerate(rows, 1):
             if i % 500 == 0:
                 self.log(f"attachments analysed: {i:,}/{len(rows):,}")
-            path = self.case.blobs.path(sha)
-            if not path.exists() or size > docmeta.MAX_DOC_BYTES:
+            if len(saved) >= DOC_CHECKPOINT:
+                self._save("doc", saved)
+                saved = []
+            if sha in done:
+                data = done.pop(sha)
+                self._restore_side_effects(data)
+                self.doc_terms[sha].update(data.get("terms", []))
+                if data.get("row") is not None:
+                    self.attachment_rows.append(_load_attachment_row(data["row"]))
                 continue
-            try:
-                meta = docmeta.analyse(path.read_bytes(), filename, ctype)
-            except Exception as e:
-                self.reviews.append({"reason": "attachment_unreadable", "sha256": sha, "detail": {"filename": filename, "error": f"{type(e).__name__}: {e}"}})
+            e0, v0 = len(self.evidence), len(self.reviews)
+            row = self._attachment(sha, filename, ctype, size, terms)
+            if row is _SKIPPED:
                 continue
-            if meta is None:
-                continue
-            sample = (meta.text_sample or "").lower()
-            for did, ts in terms.items():
-                if any(t in sample for t in ts):
-                    self.doc_terms[sha].add(did)
-            places = set()
-            for code, p in self.settings.places.items():
-                hay = " ".join(x for x in (meta.company, meta.author, meta.last_modified_by, meta.template) if x).lower()
-                if any(ent.lower() in hay for ent in p.entities):
-                    places.add(code)
-            for off, at in ((meta.created_offset, meta.created), (meta.modified_offset, meta.modified)):
-                pl = self.settings.place_for_offset(off, at)
+            if row is not None:
+                self.attachment_rows.append(row)
+            saved.append((sha, {"row": _dump_attachment_row(row) if row is not None else None,
+                                "terms": sorted(self.doc_terms.get(sha, ())), **self._captured(e0, v0)}, None))
+        self._save("doc", saved)
+        self.stats["attachments_with_metadata"] = len(self.attachment_rows)
+
+    def _attachment(self, sha: str, filename, ctype, size, terms: dict[str, list[str]]):
+        path = self.case.blobs.path(sha)
+        if not path.exists() or size > docmeta.MAX_DOC_BYTES:
+            return None
+        self.guard.check()
+        if not self.guard.fits(size * 8):
+            self.reviews.append({"reason": "attachment_skipped_low_memory", "sha256": sha,
+                                 "detail": {"filename": filename, "size_bytes": size,
+                                            "note": "not enough free memory to read it safely; run analyze again with more memory free"}})
+            return _SKIPPED
+        try:
+            meta = docmeta.analyse(path.read_bytes(), filename, ctype)
+        except INTERRUPTIONS:
+            raise
+        except Exception as e:
+            self.reviews.append({"reason": "attachment_unreadable", "sha256": sha, "detail": {"filename": filename, "error": f"{type(e).__name__}: {e}"}})
+            return None
+        if meta is None:
+            return None
+        sample = (meta.text_sample or "").lower()
+        for did, ts in terms.items():
+            if any(t in sample for t in ts):
+                self.doc_terms[sha].add(did)
+        places = set()
+        for code, p in self.settings.places.items():
+            hay = " ".join(x for x in (meta.company, meta.author, meta.last_modified_by, meta.template) if x).lower()
+            if any(ent.lower() in hay for ent in p.entities):
+                places.add(code)
+        for off, at in ((meta.created_offset, meta.created), (meta.modified_offset, meta.modified)):
+            pl = self.settings.place_for_offset(off, at)
+            if pl:
+                places.add(pl)
+        for ed in meta.editors:
+            ed_at = None
+            if ed.get("last"):
+                try:
+                    ed_at = _utc(ed["last"])
+                except ValueError:
+                    ed_at = None
+            for off in ed.get("offsets", []):
+                pl = self.settings.place_for_offset(off, ed_at or meta.modified)
                 if pl:
                     places.add(pl)
-            for ed in meta.editors:
-                ed_at = None
-                if ed.get("last"):
-                    try:
-                        ed_at = _utc(ed["last"])
-                    except ValueError:
-                        ed_at = None
-                for off in ed.get("offsets", []):
-                    pl = self.settings.place_for_offset(off, ed_at or meta.modified)
-                    if pl:
-                        places.add(pl)
-                        pid = self.by_name.get(ed["author"].strip().lower())
-                        if ed.get("last"):
-                            try:
-                                at = _utc(ed["last"])
-                                self.evidence.append(Evidence(pid or f"author:{ed['author']}", None, "tz_document_revision", pl, at, at, "weak",
-                                                              {"sha256": sha, "filename": filename, "offset_minutes": off}))
-                            except ValueError:
-                                pass
-            for ip in meta.ips:
-                ip["place"] = metadata.place_for_ip(ip["ip"], self.settings)
-                if ip["place"]:
-                    places.add(ip["place"])
-            if meta.esign is not None:
-                self.reviews.append({"reason": "esign_audit_trail", "sha256": sha,
-                                     "detail": {"filename": filename, **meta.esign,
-                                                "note": "read signer IPs and times from the certificate; geolocate historically"}})
-            self.conn.execute(
-                "INSERT INTO attachment_meta (sha256, run_id, kind, title, author, last_modified_by, company, application, template,"
-                " created, created_offset, modified, modified_offset, editors, esign, ips, places, detail)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (sha, self.run_id, meta.kind, meta.title, meta.author, meta.last_modified_by, meta.company, meta.application,
-                 meta.template, meta.created, meta.created_offset, meta.modified, meta.modified_offset, Jsonb(meta.editors),
-                 Jsonb(meta.esign) if meta.esign is not None else None, Jsonb(meta.ips), sorted(places), Jsonb(meta.detail)),
-            )
-            inserted += 1
-        self.stats["attachments_with_metadata"] = inserted
+                    pid = self.by_name.get(ed["author"].strip().lower())
+                    if ed.get("last"):
+                        try:
+                            at = _utc(ed["last"])
+                            self.evidence.append(Evidence(pid or f"author:{ed['author']}", None, "tz_document_revision", pl, at, at, "weak",
+                                                          {"sha256": sha, "filename": filename, "offset_minutes": off}))
+                        except ValueError:
+                            pass
+        for ip in meta.ips:
+            ip["place"] = metadata.place_for_ip(ip["ip"], self.settings)
+            if ip["place"]:
+                places.add(ip["place"])
+        if meta.esign is not None:
+            self.reviews.append({"reason": "esign_audit_trail", "sha256": sha,
+                                 "detail": {"filename": filename, **meta.esign,
+                                            "note": "read signer IPs and times from the certificate; geolocate historically"}})
+        return (sha, meta.kind, meta.title, meta.author, meta.last_modified_by, meta.company, meta.application,
+                meta.template, meta.created, meta.created_offset, meta.modified, meta.modified_offset, meta.editors,
+                meta.esign, meta.ips, sorted(places), meta.detail)
+
+    def insert_attachment_meta(self) -> None:
+        with self.conn.cursor() as cur:
+            for i in range(0, len(self.attachment_rows), WRITE_CHUNK):
+                cur.executemany(
+                    "INSERT INTO attachment_meta (sha256, run_id, kind, title, author, last_modified_by, company, application, template,"
+                    " created, created_offset, modified, modified_offset, editors, esign, ips, places, detail)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    [(r[0], self.run_id, *r[1:12], Jsonb(r[12]), Jsonb(r[13]) if r[13] is not None else None, Jsonb(r[14]), r[15], Jsonb(r[16]))
+                     for r in self.attachment_rows[i : i + WRITE_CHUNK]],
+                )
 
     def link_decisions(self) -> None:
         for d in self.decisions:
@@ -936,12 +1019,13 @@ class Analyzer:
         self.stats["client_ip_networks"] = len(nets)
 
     def write(self) -> None:
-        self._stash_authored()
         with self.conn.cursor() as cur:
             ids = list(self.results)
             for i in range(0, len(ids), WRITE_CHUNK):
                 chunk = ids[i : i + WRITE_CHUNK]
-                authored = dict(cur.execute("SELECT msg_id, authored_text FROM analysis_authored WHERE msg_id = ANY(%s)", (chunk,)).fetchall())
+                authored = {int(k): v for k, v in cur.execute(
+                    "SELECT item, authored_text FROM analysis_checkpoint WHERE run_key = %s AND scope = 'message' AND item = ANY(%s)",
+                    (self.run_key, [str(m) for m in chunk])).fetchall()}
                 cur.executemany(
                     "INSERT INTO message_analysis (msg_id, run_id, thread_key, sender_address, sender_person, custodian_sent, sent_utc,"
                     " authored_text, roles, phrases, questions, client, mobile, client_ips, offset_minutes, offset_method, offset_detail,"
@@ -1005,44 +1089,114 @@ def _json(v):
     return v
 
 
+_SKIPPED = object()
+_RESULT_FIELDS = tuple(f for f in Result.__dataclass_fields__ if f != "authored_text")
+_EVIDENCE_FIELDS = tuple(Evidence.__dataclass_fields__)
+
+
+def _dump_result(r: Result) -> dict:
+    return {f: getattr(r, f) for f in _RESULT_FIELDS}
+
+
+def _load_result(d: dict) -> Result:
+    r = Result(**d)
+    if isinstance(r.sent_utc, str):
+        r.sent_utc = datetime.fromisoformat(r.sent_utc)
+    return r
+
+
+def _dump_evidence(e: Evidence) -> dict:
+    return {f: getattr(e, f) for f in _EVIDENCE_FIELDS}
+
+
+def _load_evidence(d: dict) -> Evidence:
+    e = Evidence(**d)
+    e.start_utc, e.end_utc = datetime.fromisoformat(d["start_utc"]), datetime.fromisoformat(d["end_utc"])
+    return e
+
+
+def _dump_attachment_row(row: tuple) -> list:
+    return list(row)
+
+
+def _load_attachment_row(row: list) -> tuple:
+    row = list(row)
+    for i in (8, 10):
+        if isinstance(row[i], str):
+            row[i] = datetime.fromisoformat(row[i])
+    return tuple(row)
+
+
+def run_key(conn: psycopg.Connection, settings: Settings) -> str:
+    parts = [__version__, settings.sha256()]
+    for q in (
+        "SELECT count(*), coalesce(max(id), 0) FROM message",
+        "SELECT count(*), coalesce(max(id), 0) FROM attachment",
+        "SELECT md5(coalesce(string_agg(p::text, ',' ORDER BY p.id), '')) FROM person p",
+        "SELECT md5(coalesce(string_agg(a::text, ',' ORDER BY a.address), '')) FROM person_address a",
+        "SELECT md5(coalesce(string_agg(d::text, ',' ORDER BY d.id), '')) FROM decision d",
+    ):
+        parts.append(str(conn.execute(q).fetchone()))
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
 ANALYSIS_TABLES = ("review_item", "anomaly", "sendtime_week", "decision_message", "attachment_meta", "location_evidence", "message_analysis")
 
 
-def analyze_case(case: Case, settings: Settings, argv: list[str], log: Callable[[str], None] = lambda s: None) -> dict:
+def analyze_case(case: Case, settings: Settings, argv: list[str], log: Callable[[str], None] = lambda s: None,
+                 guard: Guard = NO_GUARD) -> dict:
     with db.connect(case.dsn) as conn:
         db.migrate(conn)
+        conn.execute("UPDATE analysis_run SET status = 'interrupted', finished_at = now() WHERE finished_at IS NULL")
         run_id = conn.execute(
             "INSERT INTO analysis_run (tool_version, argv, config, config_sha256) VALUES (%s, %s, %s, %s) RETURNING id",
             (__version__, Jsonb(argv), Jsonb(_json(settings.raw)), settings.sha256()),
         ).fetchone()[0]
         a = Analyzer(conn, case, settings, log)
         a.run_id = run_id
+        a.guard = guard
         try:
+            a.run_key = run_key(conn, settings)
+            conn.execute("DELETE FROM analysis_checkpoint WHERE run_key <> %s", (a.run_key,))
+            incomplete = conn.execute("SELECT count(*) FROM source_file WHERE status <> 'complete'").fetchone()[0]
+            if incomplete:
+                log(f"warning: {incomplete} source file(s) only partly ingested; run ingest again to finish them")
+                a.stats["incomplete_sources"] = incomplete
+            a.load_registers()
+            if a.custodian is None:
+                log("warning: no custodian in people register; sent items are identified by folder only")
+            a.load_lite()
+            a.build_threads()
+            a.message_pass()
+            a.recover_offsets()
+            a.label_fingerprints()
+            a.profile_writers()
+            a.judge_offsets()
+            a.offset_evidence()
+            a.send_patterns()
+            a.assign_places()
+            a.attachments()
+            log("writing results")
             with conn.transaction():
                 for t in ANALYSIS_TABLES:
                     conn.execute(f"DELETE FROM {t}")
-                a.load_registers()
-                if a.custodian is None:
-                    log("warning: no custodian in people register; sent items are identified by folder only")
-                a.load_lite()
-                a.build_threads()
-                a.message_pass()
-                a.recover_offsets()
-                a.label_fingerprints()
-                a.profile_writers()
-                a.judge_offsets()
-                a.offset_evidence()
-                a.send_patterns()
-                a.assign_places()
-                a.attachments()
+                a.insert_attachment_meta()
                 a.link_decisions()
                 a.find_anomalies()
-                log("writing results")
                 a.write()
+                conn.execute("DELETE FROM analysis_checkpoint")
         except Exception as e:
-            conn.execute("UPDATE analysis_run SET finished_at = now(), status = %s, stats = %s WHERE id = %s",
-                         ("failed", Jsonb({"error": f"{type(e).__name__}: {e}"}), run_id))
+            status = "interrupted" if isinstance(e, INTERRUPTIONS) else "failed"
+            try:
+                conn.execute("UPDATE analysis_run SET finished_at = now(), status = %s, stats = %s WHERE id = %s",
+                             (status, Jsonb({"error": f"{type(e).__name__}: {e}", "resumable": True}), run_id))
+            except psycopg.Error:
+                pass
             raise
+        if a.resumed["message"] or a.resumed["doc"]:
+            a.stats["resumed_from_checkpoint"] = dict(a.resumed)
+        if guard.events:
+            a.stats["low_memory_events"] = guard.events
         a.stats["tzdata_version"] = zones.tzdata_version()
         stats = _json(dict(a.stats))
         conn.execute("UPDATE analysis_run SET finished_at = now(), status = 'completed', stats = %s WHERE id = %s", (Jsonb(stats), run_id))

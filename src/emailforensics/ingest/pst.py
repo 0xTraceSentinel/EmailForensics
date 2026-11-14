@@ -87,6 +87,7 @@ class PstEntry:
     state: str
     item: MapiItem | None = None
     error: str | None = None
+    seq: int = -1
 
 
 @dataclass
@@ -95,6 +96,13 @@ class _Reader:
     codepage: str
     seen: set[str] = field(default_factory=set)
     tick: Callable[[], None] = field(default=lambda: None)
+    count: int = 0
+    skip: int = 0
+
+    def next_seq(self) -> int:
+        seq = self.count
+        self.count += 1
+        return seq
 
     def props(self, record_set, skip: frozenset[int] = frozenset()) -> Props:
         out: Props = {}
@@ -165,12 +173,12 @@ class _Reader:
         self.seen.add(path)
         return path
 
-    def entry(self, base: str, folder_path: list[str], state: str, message) -> PstEntry:
+    def entry(self, base: str, folder_path: list[str], state: str, message, seq: int = -1) -> PstEntry:
         path = self.path(base)
         try:
-            return PstEntry(path, folder_path, state, self.message(message))
+            return PstEntry(path, folder_path, state, self.message(message), seq=seq)
         except Exception as e:
-            return PstEntry(path, folder_path, state, error=f"{type(e).__name__}: {e}")
+            return PstEntry(path, folder_path, state, error=f"{type(e).__name__}: {e}", seq=seq)
 
 
 def _name_map(pst) -> dict[int, NamedProp]:
@@ -187,20 +195,30 @@ def _name_map(pst) -> dict[int, NamedProp]:
 def _walk(reader: _Reader, folder, path: list[str], recoverable: bool) -> Iterator[PstEntry]:
     state = "recoverable" if recoverable else "live"
     for i in range(folder.number_of_sub_messages):
+        seq = reader.next_seq()
         try:
             message = folder.get_sub_message(i)
         except OSError as e:
             reader.tick()
-            yield PstEntry(reader.path(f"pst:{folder.identifier}:{i}"), path, state, error=f"OSError: {e}")
+            item_path = reader.path(f"pst:{folder.identifier}:{i}")
+            if seq >= reader.skip:
+                yield PstEntry(item_path, path, state, error=f"OSError: {e}", seq=seq)
             continue
-        entry = reader.entry(f"pst:{message.identifier}", path, state, message)
+        if seq < reader.skip:
+            reader.path(f"pst:{message.identifier}")
+            reader.tick()
+            continue
+        entry = reader.entry(f"pst:{message.identifier}", path, state, message, seq)
         reader.tick()
         yield entry
     for j in range(folder.number_of_sub_folders):
         try:
             sub = folder.get_sub_folder(j)
         except OSError as e:
-            yield PstEntry(reader.path(f"pst:folder:{folder.identifier}:{j}"), path, state, error=f"OSError: {e}")
+            seq = reader.next_seq()
+            item_path = reader.path(f"pst:folder:{folder.identifier}:{j}")
+            if seq >= reader.skip:
+                yield PstEntry(item_path, path, state, error=f"OSError: {e}", seq=seq)
             continue
         name = sub.name or ""
         yield from _walk(reader, sub, path + [name], recoverable or name.lower() == RECOVERABLE_ITEMS)
@@ -208,6 +226,7 @@ def _walk(reader: _Reader, folder, path: list[str], recoverable: bool) -> Iterat
 
 def _orphans(reader: _Reader, pst) -> Iterator[PstEntry]:
     for i in range(pst.number_of_orphan_items):
+        seq = reader.next_seq()
         try:
             item = pst.get_orphan_item(i)
             if not item.number_of_record_sets or item.get_record_set(0).get_entry_by_type(PR_MESSAGE_CLASS) is None:
@@ -216,7 +235,11 @@ def _orphans(reader: _Reader, pst) -> Iterator[PstEntry]:
         except OSError:
             reader.tick()
             continue
-        entry = reader.entry(f"pst:orphan:{item.identifier}", [], "orphan", item)
+        if seq < reader.skip:
+            reader.path(f"pst:orphan:{item.identifier}")
+            reader.tick()
+            continue
+        entry = reader.entry(f"pst:orphan:{item.identifier}", [], "orphan", item, seq)
         reader.tick()
         yield entry
 
@@ -237,6 +260,7 @@ def read_pst(
     path: Path,
     on_total: Callable[[int], None] | None = None,
     tick: Callable[[], None] | None = None,
+    skip: int = 0,
 ) -> Iterator[PstEntry]:
     import pypff
 
@@ -245,7 +269,7 @@ def read_pst(
         pst.open_file_object(fh)
         try:
             codepage = (pst.ascii_codepage or b"cp1252").decode("ascii", "replace")
-            reader = _Reader(_name_map(pst), codepage)
+            reader = _Reader(_name_map(pst), codepage, skip=skip)
             if tick is not None:
                 reader.tick = tick
             root = pst.get_root_folder()

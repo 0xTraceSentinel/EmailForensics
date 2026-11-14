@@ -24,18 +24,70 @@ def finish_run(conn: psycopg.Connection, run_id: int, errors: list[dict]) -> Non
     )
 
 
+def interrupt_run(conn: psycopg.Connection, run_id: int) -> None:
+    conn.execute("UPDATE ingest_run SET finished_at = now(), status = 'interrupted' WHERE id = %s", (run_id,))
+
+
 def source_exists(conn: psycopg.Connection, sha256: str) -> bool:
-    return conn.execute("SELECT 1 FROM source_file WHERE sha256 = %s", (sha256,)).fetchone() is not None
+    return conn.execute("SELECT 1 FROM source_file WHERE sha256 = %s AND status = 'complete'", (sha256,)).fetchone() is not None
+
+
+@dataclass
+class SourceState:
+    id: int
+    status: str
+    items_done: int
+    item_errors: list[dict]
+    custodian: str | None
+
+
+def source_state(conn: psycopg.Connection, sha256: str) -> SourceState | None:
+    row = conn.execute(
+        "SELECT id, status, items_done, item_errors, custodian FROM source_file WHERE sha256 = %s", (sha256,)
+    ).fetchone()
+    return SourceState(row[0], row[1], row[2], list(row[3] or []), row[4]) if row else None
 
 
 def insert_source(
-    conn: psycopg.Connection, run_id: int, path: Path, fmt: str, sha256: str, custodian: str | None
+    conn: psycopg.Connection, run_id: int, path: Path, fmt: str, sha256: str, custodian: str | None,
+    status: str = "complete",
 ) -> int:
     return conn.execute(
-        "INSERT INTO source_file (run_id, path, file_name, format, size_bytes, sha256, custodian)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
-        (run_id, str(path.resolve()), path.name, fmt, path.stat().st_size, sha256, custodian),
+        "INSERT INTO source_file (run_id, path, file_name, format, size_bytes, sha256, custodian, status)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (run_id, str(path.resolve()), path.name, fmt, path.stat().st_size, sha256, custodian, status),
     ).fetchone()[0]
+
+
+def resume_source(conn: psycopg.Connection, source_id: int, run_id: int) -> None:
+    conn.execute(
+        "UPDATE ingest_run SET status = 'interrupted', finished_at = coalesce(finished_at, now())"
+        " WHERE status = 'running' AND id <> %s AND id IN"
+        " (SELECT run_id FROM source_file WHERE id = %s UNION SELECT unnest(resumed_runs) FROM source_file WHERE id = %s)",
+        (run_id, source_id, source_id),
+    )
+    conn.execute("UPDATE source_file SET resumed_runs = array_append(resumed_runs, %s) WHERE id = %s", (run_id, source_id))
+
+
+def checkpoint_source(conn: psycopg.Connection, source_id: int, items_done: int, errors: list[dict]) -> None:
+    conn.execute(
+        "UPDATE source_file SET items_done = %s, item_errors = item_errors || %s WHERE id = %s",
+        (items_done, Jsonb(errors), source_id),
+    )
+
+
+def complete_source(conn: psycopg.Connection, source_id: int) -> None:
+    conn.execute("UPDATE source_file SET status = 'complete', ingested_at = now() WHERE id = %s", (source_id,))
+
+
+def delete_source(conn: psycopg.Connection, source_id: int) -> None:
+    ids = "SELECT id FROM message WHERE source_file_id = %s"
+    for table in ("message_analysis", "location_evidence", "decision_message"):
+        conn.execute(f"DELETE FROM {table} WHERE msg_id IN ({ids})", (source_id,))
+    conn.execute(f"DELETE FROM attachment WHERE msg_id IN ({ids})", (source_id,))
+    conn.execute("UPDATE message SET parent_id = NULL WHERE source_file_id = %s", (source_id,))
+    conn.execute("DELETE FROM message WHERE source_file_id = %s", (source_id,))
+    conn.execute("DELETE FROM source_file WHERE id = %s", (source_id,))
 
 
 @dataclass

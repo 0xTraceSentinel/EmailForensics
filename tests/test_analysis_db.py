@@ -161,3 +161,69 @@ def test_analysis_and_report_end_to_end(case, tmp_path):
     assert stale and "Stale analysis" in index.read_text(encoding="utf-8")
     analyze_case(case, load_settings(None), ["test"])
     assert build_report(case, load_settings(None), tmp_path / "report", verify=False)[1] is False
+
+
+def _snapshot(case):
+    with db.connect(case.dsn) as conn:
+        return {
+            "ma": conn.execute("SELECT msg_id, authored_text, roles, phrases::text, offset_minutes, offset_method, offset_detail::text, place,"
+                               " place_method, writer::text, offset_candidates::text FROM message_analysis ORDER BY msg_id").fetchall(),
+            "le": conn.execute("SELECT person_id, msg_id, method, place, start_utc, end_utc, strength, detail::text FROM location_evidence"
+                               " ORDER BY 1, 2, 3, 4, 5, 8").fetchall(),
+            "am": conn.execute("SELECT sha256, kind, author, created, places FROM attachment_meta ORDER BY 1").fetchall(),
+            "dm": conn.execute("SELECT decision_id, msg_id, reasons FROM decision_message ORDER BY 1, 2").fetchall(),
+            "an": conn.execute("SELECT kind, msg_id, sha256, detail::text FROM anomaly ORDER BY 1, 2, 3, 4").fetchall(),
+            "rv": conn.execute("SELECT reason, msg_id, sha256, detail::text FROM review_item ORDER BY 1, 2, 3, 4").fetchall(),
+        }
+
+
+def test_interrupted_analysis_resumes_from_checkpoints(case, tmp_path, monkeypatch):
+    from emailforensics.analysis import run
+    from emailforensics.memory import MemoryPressure
+
+    load_mailbox(case, tmp_path)
+    save_people(case, [Person("exec", "Jane CFO", ["Jane CFO"], ["cfo@group.example"], "ZA", "CFO", True, True)])
+    save_decisions(case, [Decision("D1", "Acquire Falcon", date(2023, 6, 14), "Port Louis", "MU", "Minutes",
+                                   ["Project Falcon"], date(2023, 6, 1), date(2023, 6, 30))])
+    settings = load_settings(None)
+    analyze_case(case, settings, ["test"])
+    clean = _snapshot(case)
+    assert clean["ma"] and clean["am"]
+
+    monkeypatch.setattr(run, "PAGE", 2)
+    real_one = run.Analyzer._one
+    seen = []
+
+    def failing_one(self, m, *args):
+        seen.append(m.id)
+        if len(seen) == 5:
+            raise MemoryPressure("test")
+        return real_one(self, m, *args)
+
+    monkeypatch.setattr(run.Analyzer, "_one", failing_one)
+    with pytest.raises(MemoryPressure):
+        analyze_case(case, settings, ["test"])
+    assert _snapshot(case) == clean
+    with db.connect(case.dsn) as conn:
+        assert conn.execute("SELECT count(*) FROM analysis_checkpoint WHERE scope = 'message'").fetchone()[0] == 4
+        assert conn.execute("SELECT status FROM analysis_run ORDER BY id DESC LIMIT 1").fetchone()[0] == "interrupted"
+
+    monkeypatch.setattr(run.Analyzer, "_one", real_one)
+    real_write = run.Analyzer.write
+
+    def failing_write(self):
+        raise MemoryPressure("test")
+
+    monkeypatch.setattr(run.Analyzer, "write", failing_write)
+    with pytest.raises(MemoryPressure):
+        analyze_case(case, settings, ["test"])
+    monkeypatch.setattr(run.Analyzer, "write", real_write)
+    with db.connect(case.dsn) as conn:
+        conn.execute("UPDATE analysis_run SET status = 'running', finished_at = NULL WHERE id = (SELECT max(id) FROM analysis_run)")
+    stats = analyze_case(case, settings, ["test"])
+    assert stats["resumed_from_checkpoint"]["message"] == len(clean["ma"])
+    assert stats["resumed_from_checkpoint"]["doc"] >= len(clean["am"])
+    assert _snapshot(case) == clean
+    with db.connect(case.dsn) as conn:
+        assert conn.execute("SELECT count(*) FROM analysis_checkpoint").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM analysis_run WHERE status = 'running'").fetchone()[0] == 0

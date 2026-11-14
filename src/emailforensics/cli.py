@@ -10,6 +10,41 @@ from emailforensics.case import Case, create_case
 
 app = typer.Typer(help="Offline POEM analysis of exported mailboxes.", no_args_is_help=True)
 
+INTERRUPTED_EXIT = 3
+
+MinFreeOption = Annotated[
+    Optional[int],
+    typer.Option(
+        "--min-free-mb",
+        help="Stop cleanly, keeping progress, if free memory stays below this many MB (default 1024, or "
+             "EMAILFORENSICS_MIN_FREE_MB; 0 turns the guard off). Batches shrink below twice this value.",
+    ),
+]
+
+
+def _guard(min_free: Optional[int]):
+    from emailforensics.memory import Guard, min_free_mb
+
+    return Guard(min_free_mb(min_free), log=lambda s: typer.echo(f"\n{s}", err=True))
+
+
+def _interrupted(command: str, e: BaseException) -> None:
+    import psycopg
+
+    from emailforensics.memory import MemoryPressure
+
+    if isinstance(e, MemoryPressure):
+        why = f"stopped to avoid running out of memory: {e}"
+    elif isinstance(e, MemoryError):
+        why = "ran out of memory"
+    elif isinstance(e, psycopg.OperationalError):
+        why = f"lost the database connection ({str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__}); if Docker ran out of memory, raise its limit or close other programs"
+    else:
+        raise e
+    typer.echo(f"\n{command} interrupted: {why}.", err=True)
+    typer.echo(f"Progress is saved. Free some memory and run the same `emailforensics {command}` command again to resume.", err=True)
+    raise typer.Exit(INTERRUPTED_EXIT)
+
 
 @app.command(help="Create a case folder and its PostgreSQL database.")
 def init(
@@ -38,6 +73,7 @@ def ingest(
             help="Show progress on stderr: a live bar in a terminal, a status line every 15 s when redirected.",
         ),
     ] = True,
+    min_free: MinFreeOption = None,
 ) -> None:
     from emailforensics.console import make_progress
     from emailforensics.ingest.pipeline import ingest_paths
@@ -50,9 +86,11 @@ def ingest(
 
     reporter = make_progress(progress)
     try:
-        summary = ingest_paths(case, inputs, custodian, argv=sys.argv, progress=reporter)
-    finally:
+        summary = ingest_paths(case, inputs, custodian, argv=sys.argv, progress=reporter, guard=_guard(min_free))
+    except Exception as e:
         reporter.close()
+        _interrupted("ingest", e)
+    reporter.close()
 
     ingested = [f for f in summary.files if f.status == "ingested"]
     typer.echo(
@@ -125,11 +163,17 @@ def register(
 def analyze(
     case_dir: Annotated[Path, typer.Argument(help="Case folder.")],
     config: ConfigOption = None,
+    min_free: MinFreeOption = None,
 ) -> None:
     from emailforensics.analysis.run import analyze_case
 
     case = _load_case(case_dir)
-    stats = analyze_case(case, _settings(config), argv=sys.argv, log=lambda s: typer.echo(s, err=True))
+    settings = _settings(config)
+    try:
+        stats = analyze_case(case, settings, argv=sys.argv, log=lambda s: typer.echo(s, err=True), guard=_guard(min_free))
+    except Exception as e:
+        _interrupted("analyze", e)
+
     for k, v in stats.items():
         typer.echo(f"{k}: {v}")
 
