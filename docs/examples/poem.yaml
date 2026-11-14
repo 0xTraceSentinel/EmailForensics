@@ -12,4 +12,6 @@ extra_phrases:
 sendtime:
   min_days: 3
   tolerance_min: 45
+writer_profile:
+  utc_reference_zones: [Europe/London]
 excluded_folders: ["Junk Email", "RSS Feeds", "Sync Issues"]

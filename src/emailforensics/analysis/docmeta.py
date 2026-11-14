@@ -13,6 +13,9 @@ from emailforensics.analysis.metadata import _ips, ip_scope
 MAX_DOC_BYTES = 200 << 20
 MAX_PDF_STREAMS = 4000
 MAX_STREAM_OUT = 8 << 20
+MAX_PDF_INFLATE = 64 << 20
+MAX_PDF_TEXT = 400_000
+_PDF_SKIP = re.compile(rb"/Subtype\s*/Image|/DCTDecode|/JPXDecode|/CCITTFaxDecode|/JBIG2Decode|/FontFile|/Length[23]\b")
 
 NS = {
     "cp": "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
@@ -272,34 +275,46 @@ def _xmp(blob: bytes, tag: str) -> str | None:
     return m.group(1).decode("utf-8", "replace").strip() if m else None
 
 
-def _pdf_streams(data: bytes) -> list[bytes]:
-    out = []
+def _pdf_streams(data: bytes):
+    budget = MAX_PDF_INFLATE
     for i, m in enumerate(re.finditer(rb"stream\r?\n", data)):
-        if i >= MAX_PDF_STREAMS:
+        if i >= MAX_PDF_STREAMS or budget <= 0:
             break
         end = data.find(b"endstream", m.end())
         if end < 0:
             break
-        raw = data[m.end() : end]
+        lo = max(0, m.start() - 2000)
+        head = data.rfind(b" obj", lo, m.start())
+        if _PDF_SKIP.search(data, head if head >= 0 else lo, m.start()):
+            continue
         try:
-            d = zlib.decompressobj()
-            out.append(d.decompress(raw, MAX_STREAM_OUT))
+            out = zlib.decompressobj().decompress(memoryview(data)[m.end() : end], min(MAX_STREAM_OUT, budget))
         except zlib.error:
             continue
-    return out
+        budget -= len(out)
+        yield out
 
 
-def _pdf_text(streams: list[bytes]) -> str:
+def _pdf_text_parts(s: bytes) -> list[str]:
     parts = []
-    for s in streams:
-        for m in re.finditer(rb"\(((?:\\.|[^\\)]){1,400})\)\s*'?T[jJ']?|\[((?:[^\]]){1,2000})\]\s*TJ", s):
-            if m.group(1) is not None:
-                parts.append(_decode_pdf_text(m.group(1)) or "")
-            else:
-                parts.append("".join(_decode_pdf_text(x) or "" for x in re.findall(rb"\(((?:\\.|[^\\)])*)\)", m.group(2))))
-        if sum(len(p) for p in parts) > 400_000:
-            break
-    return re.sub(r"[ \t]+", " ", " ".join(parts))
+    for m in re.finditer(rb"\(((?:\\.|[^\\)]){1,400})\)\s*'?T[jJ']?|\[((?:[^\]]){1,2000})\]\s*TJ", s):
+        if m.group(1) is not None:
+            parts.append(_decode_pdf_text(m.group(1)) or "")
+        else:
+            parts.append("".join(_decode_pdf_text(x) or "" for x in re.findall(rb"\(((?:\\.|[^\\)])*)\)", m.group(2))))
+    return parts
+
+
+def _pdf_scan(data: bytes) -> tuple[list[bytes], str]:
+    meta, parts, size = [], [], 0
+    for s in _pdf_streams(data):
+        if b"/CreationDate" in s or b"/Producer" in s or b"xmpmeta" in s:
+            meta.append(s)
+        if size <= MAX_PDF_TEXT:
+            new = _pdf_text_parts(s)
+            parts += new
+            size += sum(len(p) for p in new)
+    return meta, re.sub(r"[ \t]+", " ", " ".join(parts))
 
 
 _ESIGN = re.compile(
@@ -311,8 +326,8 @@ _ESIGN = re.compile(
 
 def pdf(data: bytes) -> DocMeta:
     head = data[: 1 << 20] + data[-(1 << 20) :]
-    streams = _pdf_streams(data)
-    joined = head + b"".join(s for s in streams if b"/CreationDate" in s or b"/Producer" in s or b"xmpmeta" in s)
+    meta_streams, text = _pdf_scan(data)
+    joined = head + b"".join(meta_streams)
     info_at = joined.find(b"/CreationDate")
     info = joined[max(0, info_at - 2000) : info_at + 2000] if info_at >= 0 else joined
     created, c_off = pdf_date(_pdf_string(info, b"CreationDate") or b"")
@@ -331,7 +346,6 @@ def pdf(data: bytes) -> DocMeta:
     )
     producer = _decode_pdf_text(_pdf_string(info, b"Producer")) or _xmp(joined, "pdf:Producer")
     meta.detail = {k: v for k, v in {"producer": producer, "xmp_create_offset": x_c_off, "xmp_modify_offset": x_m_off}.items() if v is not None}
-    text = _pdf_text(streams)
     meta.text_sample = text[:20000]
     hits = sorted({m.group(1).lower() for m in _ESIGN.finditer(text + " " + (producer or "") + " " + (meta.application or ""))})
     if hits:

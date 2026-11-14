@@ -16,7 +16,8 @@ from emailforensics.analysis.config import Decision, Person, Settings
 from emailforensics.case import Case
 from emailforensics.store import db
 
-PAGE = 1000
+PAGE = 250
+WRITE_CHUNK = 2000
 SENT_FOLDERS = re.compile(r"^(sent items|sent mail|sent|éléments envoyés|elements envoyes|messages envoyés|gesendete elemente)$", re.I)
 DRAFT_FOLDERS = re.compile(r"^(drafts|brouillons|entwürfe)$", re.I)
 DOC_NAMES = re.compile(r"minute|resolution|r[ée]solution|board|consent|proc[eè]s[- ]verbal|pv\b|written|agreement|term ?sheet|spa\b", re.I)
@@ -35,7 +36,7 @@ def _day_bounds(d: date) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
-@dataclass
+@dataclass(slots=True)
 class Lite:
     id: int
     parent_id: int | None
@@ -60,7 +61,7 @@ class Lite:
     item_path: str
 
 
-@dataclass
+@dataclass(slots=True)
 class Result:
     msg_id: int
     thread_key: str | None = None
@@ -91,7 +92,7 @@ class Result:
     quoted_judgement: dict | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class Evidence:
     person_id: str | None
     msg_id: int | None
@@ -129,6 +130,7 @@ class Analyzer:
         self.sendtime_calibration: dict[str, dict] = {}
         self.term_patterns: dict[str, re.Pattern] = {}
         self.writer_profiles: dict[str, dict] = {}
+        self.authored_pending: list[int] = []
 
     def load_registers(self) -> None:
         for pid, name, names, base, role, board, custodian in self.conn.execute(
@@ -228,6 +230,7 @@ class Analyzer:
         last = 0
         done = 0
         quoted_jobs: list[int] = []
+        self.conn.execute("CREATE TEMP TABLE analysis_authored (msg_id bigint PRIMARY KEY, authored_text text) ON COMMIT DROP")
         while True:
             rows = self.conn.execute(
                 "SELECT id, body_text, body_html, headers, mapi_props FROM message WHERE id > %s ORDER BY id LIMIT %s",
@@ -238,9 +241,22 @@ class Analyzer:
             for mid, body_text, body_html, headers, props in rows:
                 last = mid
                 self._one(self.lite[mid], body_text, body_html, headers or [], props, quoted_jobs)
-            done += len(rows)
+            del rows
+            self._stash_authored()
+            done = len(self.results)
             self.log(f"messages analysed: {done:,}/{len(self.lite):,}")
         self.quoted_jobs = quoted_jobs
+
+    def _stash_authored(self) -> None:
+        pending = [(mid, _json(self.results[mid].authored_text)) for mid in self.authored_pending if self.results[mid].authored_text is not None]
+        self.authored_pending = []
+        if not pending:
+            return
+        with self.conn.cursor() as cur, cur.copy("COPY analysis_authored (msg_id, authored_text) FROM STDIN") as cp:
+            for row in pending:
+                cp.write_row(row)
+        for mid, _ in pending:
+            self.results[mid].authored_text = None
 
     def _one(self, m: Lite, body_text, body_html, headers: list[dict], props: dict | None, quoted_jobs: list[int]) -> None:
         r = self.results.setdefault(m.id, Result(m.id))
@@ -258,6 +274,7 @@ class Analyzer:
         q = text.split_quoted(full)
         authored = text.strip_boilerplate(q.authored)
         r.authored_text = authored[:20000]
+        self.authored_pending.append(m.id)
         r.quoted_sent = q.sent_value
         if q.sent_value:
             quoted_jobs.append(m.id)
@@ -919,30 +936,36 @@ class Analyzer:
         self.stats["client_ip_networks"] = len(nets)
 
     def write(self) -> None:
+        self._stash_authored()
         with self.conn.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO message_analysis (msg_id, run_id, thread_key, sender_address, sender_person, custodian_sent, sent_utc,"
-                " authored_text, roles, phrases, questions, client, mobile, client_ips, offset_minutes, offset_method, offset_detail,"
-                " place, place_method, place_strength, thread_index, writer, fingerprint, clock_check, clock_skew_min,"
-                " offset_candidates)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                [
-                    (r.msg_id, self.run_id, r.thread_key, r.sender_address, r.sender_person, r.custodian_sent, r.sent_utc,
-                     r.authored_text, r.roles, Jsonb(r.phrases), r.questions, r.client, r.mobile, Jsonb(r.client_ips),
-                     r.offset_minutes, r.offset_method, Jsonb(_json(r.offset_detail)) if r.offset_detail else None,
-                     r.place, r.place_method, r.place_strength, Jsonb(r.thread_index) if r.thread_index else None,
-                     Jsonb(_json(r.writer)) if r.writer else None, r.fingerprint, r.clock_check, r.clock_skew,
-                     Jsonb(_json({"date": r.offset_candidates, "quoted": r.quoted_judgement}))
-                     if (r.offset_candidates or r.quoted_judgement) else None)
-                    for r in self.results.values()
-                ],
-            )
-            cur.executemany(
-                "INSERT INTO location_evidence (run_id, person_id, msg_id, method, place, start_utc, end_utc, strength, detail)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                [(self.run_id, e.person_id, e.msg_id, e.method, e.place, e.start_utc, e.end_utc, e.strength, Jsonb(_json(e.detail)))
-                 for e in self.evidence],
-            )
+            ids = list(self.results)
+            for i in range(0, len(ids), WRITE_CHUNK):
+                chunk = ids[i : i + WRITE_CHUNK]
+                authored = dict(cur.execute("SELECT msg_id, authored_text FROM analysis_authored WHERE msg_id = ANY(%s)", (chunk,)).fetchall())
+                cur.executemany(
+                    "INSERT INTO message_analysis (msg_id, run_id, thread_key, sender_address, sender_person, custodian_sent, sent_utc,"
+                    " authored_text, roles, phrases, questions, client, mobile, client_ips, offset_minutes, offset_method, offset_detail,"
+                    " place, place_method, place_strength, thread_index, writer, fingerprint, clock_check, clock_skew_min,"
+                    " offset_candidates)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    [
+                        (r.msg_id, self.run_id, r.thread_key, r.sender_address, r.sender_person, r.custodian_sent, r.sent_utc,
+                         authored.get(r.msg_id), r.roles, Jsonb(r.phrases), r.questions, r.client, r.mobile, Jsonb(r.client_ips),
+                         r.offset_minutes, r.offset_method, Jsonb(_json(r.offset_detail)) if r.offset_detail else None,
+                         r.place, r.place_method, r.place_strength, Jsonb(r.thread_index) if r.thread_index else None,
+                         Jsonb(_json(r.writer)) if r.writer else None, r.fingerprint, r.clock_check, r.clock_skew,
+                         Jsonb(_json({"date": r.offset_candidates, "quoted": r.quoted_judgement}))
+                         if (r.offset_candidates or r.quoted_judgement) else None)
+                        for r in (self.results[mid] for mid in chunk)
+                    ],
+                )
+            for i in range(0, len(self.evidence), WRITE_CHUNK):
+                cur.executemany(
+                    "INSERT INTO location_evidence (run_id, person_id, msg_id, method, place, start_utc, end_utc, strength, detail)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    [(self.run_id, e.person_id, e.msg_id, e.method, e.place, e.start_utc, e.end_utc, e.strength, Jsonb(_json(e.detail)))
+                     for e in self.evidence[i : i + WRITE_CHUNK]],
+                )
             cur.executemany(
                 "INSERT INTO sendtime_week (person_id, week_start, days, messages, median_first_min, median_last_min, shift_min, place)"
                 " VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",

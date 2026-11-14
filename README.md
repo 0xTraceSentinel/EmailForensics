@@ -32,6 +32,21 @@ emailforensics groundtruth cases/groundtruth docs/examples/truth.yaml   # score 
 
 The server connection comes from `EMAILFORENSICS_DSN` (default: the Docker Compose credentials). Each case gets its own database (`ef_<case name>`), with attachment bytes stored content-addressed under `<case>/blobs/`.
 
+### Machines with 16 GB of RAM
+
+Measured on a 13 GB PST (33,000 items): `ingest` peaks at about 430 MB, `analyze` at about 430 MB, the database is 1.3 GB. `analyze` keeps a small summary of every message in memory, so a mailbox ten times larger needs a few GB. The larger cost on Windows is Docker's WSL 2 virtual machine, which by default may take up to half of the RAM and keeps it as file cache. Cap it in `%UserProfile%\.wslconfig`, then run `wsl --shutdown` and restart Docker Desktop:
+
+```ini
+[wsl2]
+memory=4GB
+swap=4GB
+
+[experimental]
+autoMemoryReclaim=gradual
+```
+
+Close other large applications during `analyze`, and keep the case folder on a local SSD rather than a network or USB drive.
+
 What ingest records for M1:
 - **Source files:** absolute path, size and SHA-256, hashed before and after reading. If the hash changes, that file's import is rolled back. A file already ingested (same hash) is skipped.
 - **Messages:** item path inside the source (`eml`, `mbox:12`, `mbox:12/rfc822:2` for embedded messages), byte offset and length, SHA-256 of the stored bytes, all raw headers in order, `Date` as UTC **plus the original offset** (`NULL` for `-0000`), addresses, threading IDs, bodies, parse defects, and full-text search over subject and body.
@@ -55,7 +70,7 @@ Known PST limits (libpff): an embedded message (e.g. "forward as attachment") is
 | Signal | How it is obtained | Strength |
 |---|---|---|
 | `Date` offset on the item | Transport headers, judged by who wrote them: the path (Message-ID format, Exchange headers) and the device (X-Mailer/User-Agent, mobile signatures). Writer classes that emit `+0000` when neither a configured place nor UK/Irish time is on `+0000` (or on 90% of items all year) are treated as UTC-normalised and their `+0000` is ignored; a `+0000` from a class too small to measure is never read as a place outside the configured ones | weak (desktop/service) / moderate (phone with clock check passed) |
-| Clock check | `Date` (device clock and zone) vs the first `Received` timestamp (server clock); whole-hour differences mean a mis-set time zone, and that offset is not used | filter |
+| Clock check | `Date` (device clock and zone) vs the first `Received` timestamp (server clock); a `Date` whole hours after the server received the item means a mis-set time zone, and that offset is not used; a `Date` whole hours before it (`whole_hours_late`) could also be a delayed send, so the offset is kept as weak | filter |
 | Phone vs laptop for sent items without headers | Outlook property fingerprints, labelled from sent items whose device is known (signature, or a header copy) | per cluster, with purity |
 | Offset for sent items without headers | Another copy of the same `Message-ID` in the mailbox (cc to self, distribution lists, forwards as attachment) | as above |
 | Replier's client time zone | The quoted `Sent:` / `On … wrote:` line compared with the parent message's UTC time (or the Thread-Index time of the parent), English and French formats | weak |

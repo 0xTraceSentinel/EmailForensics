@@ -206,6 +206,18 @@ def test_pdf_dates_offsets_and_esign_ips():
     assert m.ips[0]["ip"] == "102.165.3.4"
 
 
+def test_pdf_ignores_metadata_embedded_in_images():
+    logo = zlib.compress(b"\xff\xd8\xff\xe0<x:xmpmeta><xmp:CreateDate>2017-01-19T13:26:08+02:00</xmp:CreateDate></x:xmpmeta>")
+    xmp = zlib.compress(b"<x:xmpmeta><xmp:CreateDate>2021-03-02T17:58:33+04:00</xmp:CreateDate></x:xmpmeta>")
+    data = (b"%PDF-1.4\n1 0 obj\n<< /CreationDate (3/2/2021 17:58:33) >>\nendobj\n"
+            b"2 0 obj\n<</Type/XObject/Subtype/Image/Filter[/FlateDecode/DCTDecode]/Length 99>>\nstream\n" + logo + b"\nendstream\nendobj\n%%EOF")
+    m = docmeta.analyse(data, "Letter.pdf", "application/pdf")
+    assert m.created is None and m.created_offset is None
+    data = data.replace(b"%%EOF", b"3 0 obj\n<</Type/Metadata/Subtype/XML/Filter/FlateDecode/Length 99>>\nstream\n" + xmp + b"\nendstream\nendobj\n%%EOF")
+    m = docmeta.analyse(data, "Letter.pdf", "application/pdf")
+    assert m.created == datetime(2021, 3, 2, 13, 58, 33, tzinfo=timezone.utc) and m.created_offset == 240
+
+
 def test_document_metadata_drops_nul_characters():
     data = b"%PDF-1.4\n1 0 obj << /Producer (Acro\x00bat) /Author (A\x00B) /CreationDate (D:20230614091500Z) >> endobj\n%%EOF"
     m = docmeta.analyse(data, "x.pdf", None)

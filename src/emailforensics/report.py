@@ -435,7 +435,8 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
         parts.append(_table(["Offset", "Items"], [[esc(fmt_off(int(k)) if k != "none" else "none"), f"{v:,}"] for k, v in cov["sent_offset_values"].items()]))
         if with_offset and cov["sent_offset_values"].get("0", 0) > with_offset / 2:
             parts.append('<div class="banner">Most offsets on sent items are +0000. Check the Date writers table below: where a '
-                         'writer shows +0000 in both halves of the year it is UTC normalisation, not a location.</div>')
+                         'writer shows +0000 on dates when no configured place or UK/Irish time is on +0000, it is UTC normalisation, '
+                         'not a location.</div>')
         parts.append("<h3>Offsets on received mail (other senders)</h3>")
         parts.append(_table(["Offset", "Items"], [[esc(fmt_off(int(k)) if k != "none" else "none"), f"{v:,}"] for k, v in cov["received_offsets"].items()]))
         parts.append("<h3>Location evidence collected</h3>")
