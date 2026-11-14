@@ -4,14 +4,18 @@ import copy
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
+from functools import cached_property
 from pathlib import Path
 
 import yaml
 
+from emailforensics.analysis.zones import OffsetMatch, ZoneIndex
+
 DEFAULT_PLACES: dict[str, dict] = {
     "ZA": {
         "label": "South Africa",
+        "zones": ["Africa/Johannesburg"],
         "offsets": [120],
         "timezones": ["South Africa Standard Time", "Africa/Johannesburg", "Harare, Pretoria"],
         "keywords": [
@@ -26,6 +30,7 @@ DEFAULT_PLACES: dict[str, dict] = {
     },
     "MU": {
         "label": "Mauritius",
+        "zones": ["Indian/Mauritius"],
         "offsets": [240],
         "timezones": ["Mauritius Standard Time", "Indian/Mauritius", "Port Louis"],
         "keywords": [
@@ -91,6 +96,9 @@ DEFAULT_SETTINGS = {
                  "calibration_min_agreement": 0.8},
     "quoted_header": {"max_residual_min": 4},
     "anomaly": {"gap_min_weekly": 10},
+    "writer_profile": {"min_messages": 20, "min_zero_share": 0.9, "min_per_half_year": 5, "min_off_zone": 10,
+                       "min_off_zone_zero_share": 0.2, "min_off_zone_zero_share_pooled": 0.5},
+    "fingerprint": {"min_labelled": 3, "min_purity": 0.8},
     "privilege_domains": [],
     "excluded_folders": ["Junk Email", "Deleted Items/Junk", "Spam", "RSS Feeds", "Sync Issues"],
 }
@@ -100,6 +108,7 @@ DEFAULT_SETTINGS = {
 class Place:
     code: str
     label: str
+    zones: list[str]
     offsets: list[int]
     timezones: list[str]
     keywords: list[str]
@@ -141,15 +150,29 @@ class Settings:
     sendtime: dict
     quoted_header: dict
     anomaly: dict
+    writer_profile: dict
+    fingerprint: dict
     privilege_domains: list[str]
     excluded_folders: list[str]
     raw: dict = field(repr=False, default_factory=dict)
 
-    def place_for_offset(self, minutes: int | None) -> str | None:
+    @cached_property
+    def zone_index(self) -> ZoneIndex:
+        return ZoneIndex({p.code: (tuple(p.zones), tuple(p.offsets)) for p in self.places.values()})
+
+    def offset_match(self, minutes: int | None, at: datetime | date | None) -> OffsetMatch | None:
+        if minutes is None or at is None:
+            return None
+        return self.zone_index.match(int(minutes), at)
+
+    def place_for_offset(self, minutes: int | None, at: datetime | date | None = None) -> str | None:
         if minutes is None:
             return None
-        hits = [p.code for p in self.places.values() if minutes in p.offsets]
-        return hits[0] if len(hits) == 1 else None
+        if at is None:
+            hits = [p.code for p in self.places.values() if minutes in p.offsets]
+            return hits[0] if len(hits) == 1 else None
+        m = self.offset_match(minutes, at)
+        return m.places[0] if m and len(m.places) == 1 else None
 
     def place_for_timezone(self, name: str | None) -> str | None:
         if not name:
@@ -177,7 +200,8 @@ def _merge(base: dict, override: dict) -> dict:
 def load_settings(path: Path | None) -> Settings:
     data = yaml.safe_load(path.read_text(encoding="utf-8")) if path else {}
     data = data or {}
-    places_raw = _merge(DEFAULT_PLACES, data.get("places") or {})
+    defaults = DEFAULT_PLACES if data.get("default_places", True) else {}
+    places_raw = _merge(defaults, data.get("places") or {})
     phrases_raw = dict(DEFAULT_PHRASES)
     for k, v in (data.get("phrases") or {}).items():
         phrases_raw[k] = list(v)
@@ -188,6 +212,7 @@ def load_settings(path: Path | None) -> Settings:
         code.upper(): Place(
             code=code.upper(),
             label=p.get("label", code),
+            zones=list(p.get("zones", [])),
             offsets=[int(o) for o in p.get("offsets", [])],
             timezones=list(p.get("timezones", [])),
             keywords=list(p.get("keywords", [])),
@@ -198,13 +223,15 @@ def load_settings(path: Path | None) -> Settings:
         )
         for code, p in places_raw.items()
     }
-    raw = {"places": places_raw, "phrases": phrases_raw, **settings_raw}
+    raw = {"places": places_raw, "phrases": phrases_raw, "default_places": data.get("default_places", True), **settings_raw}
     return Settings(
         places=places,
         phrases=phrases_raw,
         sendtime=settings_raw["sendtime"],
         quoted_header=settings_raw["quoted_header"],
         anomaly=settings_raw["anomaly"],
+        writer_profile=settings_raw["writer_profile"],
+        fingerprint=settings_raw["fingerprint"],
         privilege_domains=[d.lower() for d in settings_raw["privilege_domains"]],
         excluded_folders=list(settings_raw["excluded_folders"]),
         raw=raw,

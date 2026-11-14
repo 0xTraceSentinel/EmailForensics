@@ -246,3 +246,42 @@ def appointment(message_class: str | None, props: dict | None, body: str) -> App
     return Appointment(
         start, end, str(location) if location else None, str(tz_name) if tz_name else None, bias, online
     )
+
+
+def earliest_received(headers: list[dict]) -> datetime | None:
+    from email.utils import parsedate_to_datetime
+
+    received = [h["value"] for h in headers if h["name"].lower() == "received"]
+    for value in reversed(received):
+        stamp = value.rsplit(";", 1)[-1].strip() if ";" in value else ""
+        if not stamp:
+            continue
+        try:
+            dt = parsedate_to_datetime(stamp)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if dt.tzinfo is None:
+            continue
+        return dt.astimezone(timezone.utc)
+    return None
+
+
+def clock_check(date_utc: datetime | None, headers: list[dict], tolerance_min: float = 5, delay_min: float = 15) -> tuple[str | None, int | None]:
+    if date_utc is None or not headers:
+        return None, None
+    server = earliest_received(headers)
+    if server is None:
+        return None, None
+    skew = (server - date_utc).total_seconds() / 60
+    if -tolerance_min <= skew <= delay_min:
+        return "consistent", round(skew)
+    hours = round(skew / 60)
+    if hours and abs(skew - hours * 60) <= tolerance_min and abs(hours) <= 14:
+        return "whole_hours_off", round(skew)
+    return ("delayed" if skew > 0 else "device_clock_ahead"), round(skew)
+
+
+def network_of(ip: str) -> str:
+    a = ipaddress.ip_address(ip)
+    prefix = 24 if a.version == 4 else 48
+    return str(ipaddress.ip_network(f"{ip}/{prefix}", strict=False))

@@ -159,5 +159,34 @@ def report(
     typer.echo(f"report written to {path}")
 
 
+@app.command(help="Score test emails tagged [TAG] in their subject against a ground-truth file (see docs/ground-truth.md).")
+def groundtruth(
+    case_dir: Annotated[Path, typer.Argument(help="Case folder with the test mailbox ingested and analysed.")],
+    truth: Annotated[Path, typer.Argument(help="truth.yaml describing each test email.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="CSV file for the per-copy results.")] = Path("groundtruth.csv"),
+) -> None:
+    from rich.console import Console
+    from rich.table import Table
+
+    from emailforensics.groundtruth import evaluate, load_truth, write_csv
+
+    try:
+        rows, summary = evaluate(_load_case(case_dir), load_truth(truth))
+    except (RuntimeError, KeyError) as e:
+        typer.echo(f"error: {e}", err=True)
+        raise typer.Exit(1)
+    write_csv(rows, out)
+    t = Table(title="Ground truth")
+    for col in ("tag", "client", "copy", "offset", "expected_offset", "offset_ok", "writer_device", "device_ok", "clock", "place", "place_ok"):
+        t.add_column(col, overflow="fold")
+    for r in rows:
+        t.add_row(*(str(r.get(c, "")) for c in ("tag", "client", "copy", "offset", "expected_offset", "offset_ok",
+                                                  "writer_device", "device_ok", "clock", "place", "place_ok")))
+    Console().print(t)
+    for k, v in summary.items():
+        typer.echo(f"{k}: {v}")
+    typer.echo(f"details written to {out}")
+
+
 if __name__ == "__main__":
     app()

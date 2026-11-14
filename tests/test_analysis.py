@@ -1,4 +1,5 @@
 import io
+from pathlib import Path
 import struct
 import zipfile
 import zlib
@@ -220,3 +221,100 @@ def test_sendtime_calibration_rejects_labels_contradicted_by_offsets():
     mu = [(t, "MU") for t, _ in za]
     assert sendtime.calibrate(weeks, mu, SETTINGS)["reliable"] is True
     assert sendtime.calibrate(weeks[:2], mu, SETTINGS)["reliable"] is False
+
+
+def test_offsets_map_by_date_with_daylight_saving():
+    from datetime import date as d
+
+    from emailforensics.analysis.config import load_settings as ls
+    import tempfile, os
+
+    cfg = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8")
+    cfg.write("places:\n  IE:\n    label: Ireland\n    zones: [Europe/Dublin]\n    keywords: [Dublin]\n")
+    cfg.close()
+    try:
+        s = ls(Path(cfg.name))
+    finally:
+        os.unlink(cfg.name)
+    assert s.place_for_offset(0, d(2023, 1, 10)) == "IE"
+    assert s.place_for_offset(0, d(2023, 7, 10)) is None
+    assert s.place_for_offset(60, d(2023, 7, 10)) == "IE"
+    assert s.place_for_offset(120, d(2023, 7, 10)) == "ZA"
+    july = s.offset_match(120, d(2023, 7, 10))
+    assert "Germany" in july.alternatives or july.alternative_count > 20
+    assert "Germany" not in [*s.offset_match(120, d(2023, 1, 10)).alternatives]
+
+
+def test_writer_classification_from_headers():
+    from emailforensics.analysis import clients
+
+    w = clients.classify([{"name": "X-Mailer", "value": "iPhone Mail (20F66)"}], "<9A8B7C6D-1111-2222-3333-444455556666@hotmail.com>", "")
+    assert (w.device, w.path, w.date_by) == ("phone", "apple_client", "client")
+    w = clients.classify([{"name": "X-MS-TNEF-Correlator", "value": ""}],
+                         "<DB7PR01MB1234ABCD@DB7PR01MB1234.eurprd01.prod.outlook.com>", "ok\n\nSent from my iPhone")
+    assert (w.device, w.path, w.date_by) == ("phone", "microsoft_cloud", "service")
+    w = clients.classify([{"name": "X-Mailer", "value": "Microsoft Outlook 16.0"}], "<000001d99e8a$6b2c1f40$41845dc0$@group.example>", "")
+    assert (w.device, w.path, w.date_by) == ("desktop", "outlook_smtp", "client")
+    assert clients.classify([], "<CAB123@mail.gmail.com>", "").path == "gmail"
+
+
+def test_fingerprint_cluster_labels_need_agreement():
+    from emailforensics.analysis import clients
+
+    out = clients.label_clusters({"a": ["phone"] * 4 + ["unknown"] * 6, "b": ["phone", "desktop", "unknown"], "c": ["phone", "unknown"]})
+    assert out["a"]["label"] == "phone" and out["a"]["purity"] == 1.0
+    assert out["b"]["label"] is None
+    assert out["c"]["label"] is None
+    props = {"0x3fde0003": {"value": 65001}, "0x0037001f": {"value": "subject"}, "0x0e1b000b": {"value": True}}
+    same = {"0x3fde0003": {"value": 65001}, "0x0037001f": {"value": "other"}, "0x0e1b000b": {"value": False}}
+    assert clients.fingerprint(props, True, True, "IPM.Note") == clients.fingerprint(same, True, True, "IPM.Note")
+    assert clients.fingerprint(props, True, False, "IPM.Note") != clients.fingerprint(props, True, True, "IPM.Note")
+
+
+def test_clock_check_flags_whole_hour_skew():
+    d = datetime(2023, 6, 14, 7, 15, tzinfo=timezone.utc)
+    rcv = lambda s: [{"name": "Received", "value": "from x by y; " + s}]
+    assert metadata.clock_check(d, rcv("Wed, 14 Jun 2023 07:15:40 +0000")) == ("consistent", 1)
+    assert metadata.clock_check(d, rcv("Wed, 14 Jun 2023 11:16:00 +0200")) == ("whole_hours_off", 121)
+    assert metadata.clock_check(d, rcv("Wed, 14 Jun 2023 08:01:00 +0000"))[0] == "delayed"
+    assert metadata.clock_check(d, [])[0] is None
+
+
+def test_boarding_pass_is_detected():
+    assert text.is_boarding("Your boarding pass: EI 154 DUB-JNB", "")
+    assert not text.is_boarding("Booking confirmation", "Your itinerary")
+
+
+def test_exchange_client_info_identifies_device():
+    from emailforensics.analysis import clients
+
+    cases = {
+        "Client=ActiveSync;User=a@b.example": ("unknown", "exchange_activesync"),
+        "Client=OWA;Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120": ("desktop", "exchange_owa"),
+        "Client=OWA;Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)": ("phone", "exchange_owa"),
+        "Client=MSExchangeRPC": ("desktop", "exchange_mapi"),
+        "Client=Hub Transport;User=a@b.example;IsClientSubmission=True": ("unknown", "smtp_submission"),
+        "Client=EBA;Action=RemindersAssistant": ("server", "exchange_server"),
+    }
+    for value, expected in cases.items():
+        w = clients.classify_client_info(value)
+        assert (w.device, w.path) == expected, value
+    assert clients.classify_client_info("Client=SomethingNew") is None
+    props = {"{41f28f13-83f4-4114-a584-eedb5a6b0bff}:ClientInfo:0x001f": {"value": "Client=ActiveSync"},
+             "{00020386-0000-0000-c000-000000000046}:x-ms-exchange-organization-originalclientipaddress:0x001f": {"value": "41.13.2.2"}}
+    assert clients.client_info(props) == "Client=ActiveSync"
+    assert clients.original_client_ip(props) == "41.13.2.2"
+    merged = clients.merge(clients.classify([], None, "hi\n\nSent from my iPhone"), clients.classify_client_info("Client=ActiveSync"))
+    assert (merged.device, merged.path) == ("phone", "exchange_activesync") and len(merged.basis) == 2
+
+
+def test_offset_matching_is_exact_on_clock_change_day(tmp_path):
+    from emailforensics.analysis.config import load_settings as ls
+
+    cfg = tmp_path / "ie.yaml"
+    cfg.write_text("places:\n  IE:\n    zones: [Europe/Dublin]\n", encoding="utf-8")
+    s = ls(cfg)
+    before = datetime(2023, 10, 29, 0, 30, tzinfo=timezone.utc)
+    after = datetime(2023, 10, 29, 1, 30, tzinfo=timezone.utc)
+    assert s.place_for_offset(60, before) == "IE" and s.place_for_offset(0, before) is None
+    assert s.place_for_offset(60, after) is None and s.place_for_offset(0, after) == "IE"

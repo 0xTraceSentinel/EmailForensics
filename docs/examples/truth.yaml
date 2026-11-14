@@ -1,0 +1,31 @@
+tests:
+  - tag: GT01
+    client: Outlook desktop
+    account: exchange
+    device: desktop
+    device_timezone: Africa/Johannesburg
+    place: ZA
+  - tag: GT02
+    client: Outlook desktop
+    account: exchange
+    device: desktop
+    device_timezone: Indian/Mauritius
+    place: MU
+  - tag: GT03
+    client: Apple Mail iPhone
+    account: exchange
+    device: phone
+    device_timezone: Indian/Mauritius
+    place: MU
+  - tag: GT04
+    client: Outlook for iOS
+    account: exchange
+    device: phone
+    device_timezone: Africa/Johannesburg
+    place: ZA
+  - tag: GT05
+    client: Outlook desktop, zone left on Johannesburg, clock set to Mauritius time
+    account: exchange
+    device: desktop
+    device_timezone: Africa/Johannesburg
+    notes: clock check should report whole_hours_off

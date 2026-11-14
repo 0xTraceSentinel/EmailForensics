@@ -11,7 +11,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from emailforensics import __version__
-from emailforensics.analysis import docmeta, metadata, sendtime, text
+from emailforensics.analysis import clients, docmeta, metadata, sendtime, text, zones
 from emailforensics.analysis.config import Decision, Person, Settings
 from emailforensics.case import Case
 from emailforensics.store import db
@@ -22,6 +22,7 @@ DRAFT_FOLDERS = re.compile(r"^(drafts|brouillons|entwürfe)$", re.I)
 DOC_NAMES = re.compile(r"minute|resolution|r[ée]solution|board|consent|proc[eè]s[- ]verbal|pv\b|written|agreement|term ?sheet|spa\b", re.I)
 
 STRENGTH_RANK = {"strong": 3, "moderate": 2, "weak": 1}
+OTHER = "OTHER"
 
 
 def _day_bounds(d: date) -> tuple[datetime, datetime]:
@@ -77,6 +78,12 @@ class Result:
     place_strength: str | None = None
     thread_index: dict | None = None
     quoted_sent: str | None = None
+    writer: dict | None = None
+    fingerprint: str | None = None
+    clock_check: str | None = None
+    clock_skew: int | None = None
+    offset_candidates: dict | None = None
+    quoted_judgement: dict | None = None
 
 
 @dataclass
@@ -116,6 +123,7 @@ class Analyzer:
         self.term_hits: dict[int, set[str]] = defaultdict(set)
         self.sendtime_calibration: dict[str, dict] = {}
         self.term_patterns: dict[str, re.Pattern] = {}
+        self.writer_profiles: dict[str, dict] = {}
 
     def load_registers(self) -> None:
         for pid, name, names, base, role, board, custodian in self.conn.execute(
@@ -258,9 +266,27 @@ class Analyzer:
                 r.roles = sorted(set(r.roles) | {"privilege"})
                 r.phrases.setdefault("privilege", []).append("privilege domain")
         r.client = metadata.client_name(headers)
-        mob = text.mobile_signature(authored[-600:] if authored else "")
-        r.mobile = mob is not None or bool(r.client and re.search(r"iphone|ipad|android|ios|mobile", r.client, re.I))
+        w = clients.classify(headers, m.rfc_message_id if headers else None, authored)
+        info = clients.client_info(props)
+        if info:
+            w = clients.merge(w, clients.classify_client_info(info))
+        if headers or info or w.device != "unknown":
+            r.writer = w.json()
+        if headers:
+            r.clock_check, r.clock_skew = metadata.clock_check(m.date_utc, headers)
+        elif m.parent_id is None:
+            r.fingerprint = clients.fingerprint(props, bool(body_text), bool(body_html), m.message_class)
+        r.mobile = w.device in ("phone", "tablet")
         r.client_ips = metadata.client_ips(headers, self.settings) if headers else []
+        orig = clients.original_client_ip(props)
+        if orig:
+            try:
+                scope = metadata.ip_scope(orig)
+                r.client_ips.append({"ip": orig, "source": "Exchange OriginalClientIPAddress", "scope": scope,
+                                     "place": metadata.place_for_ip(orig, self.settings),
+                                     "via_proxy": bool(info and "viaproxy" in info.lower())})
+            except ValueError:
+                pass
         if r.thread_index is None:
             raw = metadata.thread_index_from_header(metadata.header(headers, "Thread-Index"))
             ti = metadata.decode_thread_index(raw)
@@ -292,7 +318,7 @@ class Analyzer:
                 place = next(iter(loc_places))
                 self.evidence.append(Evidence(cust, m.id, "calendar_location", place, appt.start, end, "moderate",
                                               {"location": appt.location, "subject": m.subject, "organizer": r.sender_address}))
-            tz_place = self.settings.place_for_timezone(appt.tz_name) or self.settings.place_for_offset(appt.tz_bias)
+            tz_place = self.settings.place_for_timezone(appt.tz_name) or self.settings.place_for_offset(appt.tz_bias, appt.start)
             if tz_place and who:
                 self.evidence.append(Evidence(who, m.id, "calendar_timezone", tz_place, appt.start, end, "weak",
                                               {"timezone": appt.tz_name, "bias_offset": appt.tz_bias, "subject": m.subject,
@@ -320,15 +346,19 @@ class Analyzer:
                                               "moderate", {"subject": subject, "note": "confirm the rider is the custodian"}))
                 self.reviews.append({"reason": "verify_ride_receipt", "msg_id": m.id, "detail": {"subject": subject}})
             return
-        if text.is_travel(subject, full):
-            low, high = when.date() - timedelta(days=2), when.date() + timedelta(days=365)
+        if text.is_travel(subject, full) or text.is_boarding(subject, full):
+            boarding = text.is_boarding(subject, full)
+            low, high = when.date() - timedelta(days=2), when.date() + timedelta(days=(3 if boarding else 365))
             found = False
             for a, b, pos in text.routes(full, self.places.airport_place):
                 for d in text.dates_near(full, pos, low, high):
                     start, end = _day_bounds(d)
-                    self.evidence.append(Evidence(cust, m.id, "itinerary", self.places.airport_place[b], start, end + timedelta(days=1), "weak",
-                                                  {"route": f"{a}-{b}", "flight_date": d.isoformat(), "subject": subject,
-                                                   "note": "booked travel; confirm it was flown and by whom"}))
+                    self.evidence.append(Evidence(
+                        cust, m.id, "boarding_pass" if boarding else "itinerary", self.places.airport_place[b],
+                        start, end + timedelta(days=1), "moderate" if boarding else "weak",
+                        {"route": f"{a}-{b}", "flight_date": d.isoformat(), "subject": subject,
+                         "note": ("check-in or boarding pass issued; confirm the passenger" if boarding
+                                  else "booked travel; confirm it was flown and by whom")}))
                     found = True
             if found:
                 self.reviews.append({"reason": "verify_itinerary", "msg_id": m.id, "detail": {"subject": subject}})
@@ -349,6 +379,13 @@ class Analyzer:
                 r.offset_minutes = offsets[0]
                 r.offset_method = "date_header_copy"
                 r.offset_detail = {**(r.offset_detail or {}), "copies": [c.id for c in copies], "copy_folders": [c.folder_path for c in copies]}
+                src = self.results[copies[0].id]
+                if src.writer:
+                    r.offset_detail["copy_writer"] = src.writer
+                if src.writer and (not r.writer or r.writer.get("path") == "unknown"):
+                    r.writer = {**src.writer, "basis": [*src.writer["basis"], f"from copy msg {copies[0].id}"]}
+                if src.clock_check:
+                    r.clock_check, r.clock_skew = src.clock_check, src.clock_skew
                 recovered += 1
         self.stats["offsets_from_copies"] = recovered
         max_res = float(self.settings.quoted_header["max_residual_min"])
@@ -383,6 +420,147 @@ class Analyzer:
             quoted += 1
         self.stats["offsets_from_quoted_headers"] = quoted
 
+    def label_fingerprints(self) -> None:
+        groups: dict[str, list[Result]] = defaultdict(list)
+        for r in self.results.values():
+            if r.fingerprint and r.custodian_sent:
+                groups[r.fingerprint].append(r)
+        cfg = self.settings.fingerprint
+        clusters = clients.label_clusters(
+            {k: [(v.writer or {}).get("device", "unknown") for v in rs] for k, rs in groups.items()},
+            cfg["min_labelled"], cfg["min_purity"],
+        )
+        labelled = 0
+        for key, info in clusters.items():
+            if info["label"] is None:
+                continue
+            for r in groups[key]:
+                if r.writer and r.writer.get("device") not in (None, "unknown"):
+                    continue
+                r.writer = {**(r.writer or clients.Writer().json()), "device": info["label"],
+                            "basis": [*((r.writer or {}).get("basis") or []),
+                                      f"property fingerprint {key[:10]}: {info['labelled']} of {info['size']} labelled, purity {info['purity']}"]}
+                labelled += 1
+        self.stats["fingerprint_clusters"] = {
+            "clusters": len(clusters),
+            "labelled_clusters": sum(1 for c in clusters.values() if c["label"]),
+            "items_labelled_by_cluster": labelled,
+            "largest": sorted(({"key": k[:10], **v} for k, v in clusters.items()), key=lambda c: -c["size"])[:12],
+        }
+
+    def writer_of(self, r: Result, method: str | None) -> dict:
+        if method == "date_header_copy":
+            return (r.offset_detail or {}).get("copy_writer") or r.writer or {}
+        return r.writer or {}
+
+    def writer_key(self, r: Result, quoted: bool, method: str | None = None) -> tuple[str, str | None]:
+        who = r.sender_person if (r.sender_person and (r.sender_person in self.people)) else None
+        if quoted:
+            base = "quoted"
+        else:
+            w = self.writer_of(r, method)
+            base = f"{w.get('path', 'unknown')}/{w.get('device', 'unknown')}"
+        return base, (f"{who}|{base}" if who else None)
+
+    def profile_writers(self) -> None:
+        groups: dict[str, list[tuple[datetime, int]]] = defaultdict(list)
+        for m in self.lite.values():
+            r = self.results[m.id]
+            at = r.sent_utc or m.date_utc
+            if at is None or r.offset_minutes is None:
+                continue
+            if r.offset_method == "date_header":
+                base, personal = self.writer_key(r, False)
+                groups[base].append((at, r.offset_minutes))
+                if personal:
+                    groups[personal].append((at, r.offset_minutes))
+            qh = (r.offset_detail or {}).get("quoted_header")
+            if qh:
+                base, personal = self.writer_key(r, True)
+                if personal:
+                    groups[personal].append((at, qh["offset"]))
+        cfg = self.settings.writer_profile
+        zi = self.settings.zone_index
+        for key, rows in groups.items():
+            n = len(rows)
+            zero = sum(1 for _, o in rows if o == 0)
+            off_zone = [o for t, o in rows if not zi.any_place_at(0, t)]
+            off_zone_zero = sum(1 for o in off_zone if o == 0)
+            north_summer = sum(1 for t, _ in rows if 4 <= t.month <= 9)
+            if len(off_zone) >= cfg["min_off_zone"]:
+                threshold = cfg["min_off_zone_zero_share"] if "|" in key else cfg.get("min_off_zone_zero_share_pooled", 0.5)
+                normalised = off_zone_zero / len(off_zone) >= threshold
+                rule = "seasonal"
+            else:
+                normalised = (n >= cfg["min_messages"] and zero / n >= cfg["min_zero_share"]
+                              and north_summer >= cfg["min_per_half_year"] and n - north_summer >= cfg["min_per_half_year"])
+                rule = "all-year"
+            self.writer_profiles[key] = {
+                "messages": n, "zero_share": round(zero / n, 3), "utc_normalised": normalised, "rule": rule,
+                "off_zone_items": len(off_zone), "off_zone_zero_share": round(off_zone_zero / len(off_zone), 3) if off_zone else None,
+                "top_offsets": Counter(o for _, o in rows).most_common(6),
+                "apr_sep": north_summer, "oct_mar": n - north_summer,
+            }
+        ranked = sorted(self.writer_profiles.items(), key=lambda kv: (("|" not in kv[0]), -kv[1]["messages"]))
+        self.stats["writer_profiles"] = dict(ranked[:50])
+
+    def judge(self, r: Result, off: int | None, method: str | None, at: datetime | None) -> dict | None:
+        if off is None or at is None or method is None:
+            return None
+        match = self.settings.offset_match(off, at)
+        w = self.writer_of(r, method)
+        quoted = method.startswith("quoted_header")
+        base, personal = self.writer_key(r, quoted, method)
+        key = personal if personal and personal in self.writer_profiles else base
+        prof = self.writer_profiles.get(key)
+        reasons: list[str] = []
+        informative = True
+        if off == 0 and prof and prof["utc_normalised"]:
+            informative = False
+            if prof["rule"] == "seasonal":
+                reasons.append(f"{key} writes +0000 on {prof['off_zone_zero_share']:.0%} of {prof['off_zone_items']} items dated when no "
+                               "configured place is on +0000 (e.g. Irish summer time): UTC normalisation or a client set to UTC, not a location")
+            else:
+                reasons.append(f"{key} shows +0000 on {prof['zero_share']:.0%} of {prof['messages']} items across both halves of the year: "
+                               "UTC written by a server or a client set to UTC, not a location")
+        elif off == 0 and not quoted and w.get("date_by") == "service":
+            reasons.append("+0000 from a mail service; could be UTC normalisation rather than local time")
+        if not quoted and r.clock_check == "whole_hours_off":
+            informative = False
+            reasons.append(f"Date is {r.clock_skew} min from the first server's clock: the device's time zone setting does not match its clock")
+        place = match.places[0] if informative and len(match.places) == 1 else None
+        strength = "weak"
+        if place and not quoted and w.get("device") in ("phone", "tablet") and r.clock_check == "consistent":
+            strength = "moderate"
+            reasons.append("phone/tablet client (time zone usually set automatically) and clock consistent with the server")
+        if not quoted and w.get("date_by") == "service" and off != 0:
+            reasons.append("offset written by the mail service from the account/browser time zone setting")
+        if quoted:
+            reasons.append("display time zone of the replier's mail client")
+        return {"offset": off, "method": method, **match.json(), "informative": informative, "place": place,
+                "strength": strength, "writer_class": key, "clock": None if quoted else r.clock_check, "reasons": reasons}
+
+    def judge_offsets(self) -> None:
+        both = agree = 0
+        pairs: Counter = Counter()
+        uninformative = 0
+        for m in self.lite.values():
+            r = self.results[m.id]
+            at = r.sent_utc or m.date_utc
+            r.offset_candidates = self.judge(r, r.offset_minutes, r.offset_method, at)
+            if r.offset_candidates and not r.offset_candidates["informative"]:
+                uninformative += 1
+            qh = (r.offset_detail or {}).get("quoted_header")
+            if qh and not (r.offset_method or "").startswith("quoted_header"):
+                r.quoted_judgement = self.judge(r, qh["offset"], "quoted_header", at)
+                d, q = r.offset_candidates, r.quoted_judgement
+                if d and q and d["place"] and q["place"]:
+                    both += 1
+                    agree += d["place"] == q["place"]
+                    pairs[f"date {d['place']} / quoted {q['place']}"] += 1
+        self.stats["offsets_judged_uninformative"] = uninformative
+        self.stats["quoted_vs_date"] = {"both_placed": both, "agree": agree, "pairs": dict(pairs.most_common(8))}
+
     def offset_evidence(self) -> None:
         for m in self.lite.values():
             r = self.results[m.id]
@@ -390,19 +568,13 @@ class Analyzer:
             when = r.sent_utc
             if who is None or when is None:
                 continue
-            candidates = []
-            if r.offset_minutes is not None:
-                candidates.append((r.offset_method, r.offset_minutes))
-            qh = (r.offset_detail or {}).get("quoted_header")
-            if qh and r.offset_method not in ("quoted_header", "quoted_header_thread_index"):
-                candidates.append(("quoted_header", qh["offset"]))
-            for method, off in candidates:
-                place = self.settings.place_for_offset(off)
-                if place is None:
+            for j in (r.offset_candidates, r.quoted_judgement):
+                if not j or not j["place"]:
                     continue
-                strength = "moderate" if (r.mobile and method.startswith("date_header")) else "weak"
-                self.evidence.append(Evidence(who, m.id, f"tz_{method}", place, when, when, strength,
-                                              {"offset_minutes": off, "client": r.client, "mobile": r.mobile}))
+                self.evidence.append(Evidence(who, m.id, f"tz_{j['method']}", j["place"], when, when, j["strength"],
+                                              {"offset_minutes": j["offset"], "writer": r.writer, "clock": j["clock"],
+                                               "also_consistent_with": j["also_consistent_with"],
+                                               "also_consistent_count": j["also_consistent_count"], "reasons": j["reasons"]}))
 
     def send_patterns(self) -> None:
         by_person: dict[str, dict[str, datetime]] = defaultdict(dict)
@@ -424,7 +596,7 @@ class Analyzer:
         for m in self.lite.values():
             r = self.results[m.id]
             if r.offset_method == "date_header" and r.sent_utc and m.parent_id is None:
-                place = self.settings.place_for_offset(r.offset_minutes)
+                place = (r.offset_candidates or {}).get("place")
                 who = self.custodian.id if (r.custodian_sent and self.custodian) else r.sender_person
                 if place and who:
                     own_offsets[who].append((r.sent_utc, place))
@@ -468,11 +640,11 @@ class Analyzer:
             if who is None or when is None:
                 continue
             own: list[tuple[str, str, str]] = []
-            if r.offset_minutes is not None:
-                place = self.settings.place_for_offset(r.offset_minutes)
-                if place:
-                    strength = "moderate" if (r.mobile and r.offset_method.startswith("date_header")) else "weak"
-                    own.append((place, r.offset_method, strength))
+            j = r.offset_candidates
+            if j and j["place"]:
+                own.append((j["place"], r.offset_method, j["strength"]))
+            elif j and j["informative"] and not j["places"]:
+                own.append((OTHER, r.offset_method, j["strength"]))
             for ip in r.client_ips:
                 if ip["place"]:
                     own.append((ip["place"], "client_ip_range", "moderate"))
@@ -523,13 +695,19 @@ class Analyzer:
                 hay = " ".join(x for x in (meta.company, meta.author, meta.last_modified_by, meta.template) if x).lower()
                 if any(ent.lower() in hay for ent in p.entities):
                     places.add(code)
-            for off in (meta.created_offset, meta.modified_offset):
-                pl = self.settings.place_for_offset(off)
+            for off, at in ((meta.created_offset, meta.created), (meta.modified_offset, meta.modified)):
+                pl = self.settings.place_for_offset(off, at)
                 if pl:
                     places.add(pl)
             for ed in meta.editors:
+                ed_at = None
+                if ed.get("last"):
+                    try:
+                        ed_at = datetime.fromisoformat(ed["last"].replace("Z", "")).replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        ed_at = None
                 for off in ed.get("offsets", []):
-                    pl = self.settings.place_for_offset(off)
+                    pl = self.settings.place_for_offset(off, ed_at or meta.modified)
                     if pl:
                         places.add(pl)
                         pid = self.by_name.get(ed["author"].strip().lower())
@@ -690,40 +868,57 @@ class Analyzer:
                 self.reviews.append({"reason": "privilege", "msg_id": mid, "detail": {"phrases": r.phrases.get("privilege")}})
             if "poem_awareness" in r.roles:
                 self.reviews.append({"reason": "poem_awareness_any", "msg_id": mid, "detail": {"phrases": r.phrases.get("poem_awareness")}})
-        ips: dict[str, dict] = {}
+        for mid, r in self.results.items():
+            if r.clock_check == "whole_hours_off" and (r.sender_person or r.custodian_sent):
+                self.anomalies.append({"kind": "device_time_zone_mismatch", "msg_id": mid, "at_utc": r.sent_utc,
+                                       "detail": {"skew_min": r.clock_skew, "offset": r.offset_minutes, "writer": r.writer}})
+                self.reviews.append({"reason": "device_time_zone_mismatch", "msg_id": mid,
+                                     "detail": {"skew_min": r.clock_skew, "offset": r.offset_minutes}})
+        nets: dict[str, dict] = {}
         for mid, r in self.results.items():
             if not (r.sender_person or r.custodian_sent):
                 continue
             for ip in r.client_ips:
-                if ip["scope"] == "public" and not ip["place"]:
-                    e = ips.setdefault(ip["ip"], {"ip": ip["ip"], "sources": set(), "messages": 0, "first": None, "last": None, "senders": set()})
-                    e["sources"].add(ip["source"])
-                    e["messages"] += 1
-                    t = r.sent_utc
-                    if t:
-                        e["first"] = min(e["first"] or t, t)
-                        e["last"] = max(e["last"] or t, t)
-                    if r.sender_address:
-                        e["senders"].add(r.sender_address)
-        for e in ips.values():
-            self.reviews.append({"reason": "geolocate_ip", "detail": {
-                "ip": e["ip"], "sources": sorted(e["sources"]), "messages": e["messages"],
+                if ip["scope"] != "public" or ip["place"] or ip.get("via_proxy"):
+                    continue
+                net = metadata.network_of(ip["ip"])
+                e = nets.setdefault(net, {"network": net, "ips": set(), "sources": set(), "messages": 0, "first": None,
+                                          "last": None, "senders": set(), "first_msg_id": mid})
+                e["ips"].add(ip["ip"])
+                e["sources"].add(ip["source"])
+                e["messages"] += 1
+                t = r.sent_utc
+                if t:
+                    e["first"] = min(e["first"] or t, t)
+                    e["last"] = max(e["last"] or t, t)
+                if r.sender_address:
+                    e["senders"].add(r.sender_address)
+        for e in sorted(nets.values(), key=lambda e: -e["messages"]):
+            self.reviews.append({"reason": "geolocate_ip", "msg_id": e["first_msg_id"], "detail": {
+                "ip": e["network"], "network": e["network"], "addresses": sorted(e["ips"])[:20], "address_count": len(e["ips"]),
+                "sources": sorted(e["sources"]), "messages": e["messages"],
                 "first": e["first"].isoformat() if e["first"] else None, "last": e["last"].isoformat() if e["last"] else None,
                 "senders": sorted(e["senders"])[:20],
-                "note": "look up historical owner/geolocation; Microsoft/Google server IPs say nothing about the sender"}})
+                "note": "look up the network's historical owner and location for these dates; "
+                        "Microsoft/Google server ranges say nothing about the sender"}})
+        self.stats["client_ip_networks"] = len(nets)
 
     def write(self) -> None:
         with self.conn.cursor() as cur:
             cur.executemany(
                 "INSERT INTO message_analysis (msg_id, run_id, thread_key, sender_address, sender_person, custodian_sent, sent_utc,"
                 " authored_text, roles, phrases, questions, client, mobile, client_ips, offset_minutes, offset_method, offset_detail,"
-                " place, place_method, place_strength, thread_index)"
-                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                " place, place_method, place_strength, thread_index, writer, fingerprint, clock_check, clock_skew_min,"
+                " offset_candidates)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 [
                     (r.msg_id, self.run_id, r.thread_key, r.sender_address, r.sender_person, r.custodian_sent, r.sent_utc,
                      r.authored_text, r.roles, Jsonb(r.phrases), r.questions, r.client, r.mobile, Jsonb(r.client_ips),
-                     r.offset_minutes, r.offset_method, Jsonb(r.offset_detail) if r.offset_detail else None,
-                     r.place, r.place_method, r.place_strength, Jsonb(r.thread_index) if r.thread_index else None)
+                     r.offset_minutes, r.offset_method, Jsonb(_json(r.offset_detail)) if r.offset_detail else None,
+                     r.place, r.place_method, r.place_strength, Jsonb(r.thread_index) if r.thread_index else None,
+                     Jsonb(_json(r.writer)) if r.writer else None, r.fingerprint, r.clock_check, r.clock_skew,
+                     Jsonb(_json({"date": r.offset_candidates, "quoted": r.quoted_judgement}))
+                     if (r.offset_candidates or r.quoted_judgement) else None)
                     for r in self.results.values()
                 ],
             )
@@ -795,6 +990,9 @@ def analyze_case(case: Case, settings: Settings, argv: list[str], log: Callable[
                 a.build_threads()
                 a.message_pass()
                 a.recover_offsets()
+                a.label_fingerprints()
+                a.profile_writers()
+                a.judge_offsets()
                 a.offset_evidence()
                 a.send_patterns()
                 a.assign_places()
@@ -807,6 +1005,7 @@ def analyze_case(case: Case, settings: Settings, argv: list[str], log: Callable[
             conn.execute("UPDATE analysis_run SET finished_at = now(), status = %s, stats = %s WHERE id = %s",
                          ("failed", Jsonb({"error": f"{type(e).__name__}: {e}"}), run_id))
             raise
-        stats = dict(a.stats)
+        a.stats["tzdata_version"] = zones.tzdata_version()
+        stats = _json(dict(a.stats))
         conn.execute("UPDATE analysis_run SET finished_at = now(), status = 'completed', stats = %s WHERE id = %s", (Jsonb(stats), run_id))
         return {"run_id": run_id, **stats}

@@ -282,6 +282,17 @@ def is_travel(subject: str, text: str) -> bool:
     return bool(_TRAVEL.search(subject or "")) or bool(_TRAVEL.search(text[:4000]))
 
 
+_BOARDING = re.compile(
+    r"\b(boarding pass|mobile boarding|you(?:'re| are) checked in|check-?in (?:is )?(?:complete|confirmed|successful)|"
+    r"carte d'embarquement|bordkarte)\b",
+    re.I,
+)
+
+
+def is_boarding(subject: str, text: str) -> bool:
+    return bool(_BOARDING.search((subject or "") + "\n" + text[:4000]))
+
+
 def is_ride_receipt(subject: str, text: str) -> bool:
     return bool(_RIDE.search((subject or "") + "\n" + text[:3000]))
 

@@ -27,6 +27,7 @@ emailforensics register cases/case01 docs/examples/decisions.yaml
 emailforensics analyze cases/case01 --config docs/examples/poem.yaml
 emailforensics timeline cases/case01 D1
 emailforensics report cases/case01 --out report/ --config docs/examples/poem.yaml
+emailforensics groundtruth cases/groundtruth docs/examples/truth.yaml   # score a tagged test mailbox
 ```
 
 The server connection comes from `EMAILFORENSICS_DSN` (default: the Docker Compose credentials). Each case gets its own database (`ef_<case name>`), with attachment bytes stored content-addressed under `<case>/blobs/`.
@@ -49,24 +50,28 @@ Known PST limits (libpff): an embedded message (e.g. "forward as attachment") is
 
 ### What `analyze` derives from one mailbox
 
-`analyze` recomputes everything from the stored messages each run (results are replaced, the run and its config hash are recorded in `analysis_run`). Places, offsets, airports, IP ranges, entity names and phrase lists come from `--config` (defaults: South Africa `+0200` vs Mauritius `+0400`; see `docs/examples/poem.yaml`).
+`analyze` recomputes everything from the stored messages each run (results are replaced, the run and its config hash are recorded in `analysis_run`). Places (with IANA time zones), airports, IP ranges, entity names and phrase lists come from `--config` (defaults: South Africa `Africa/Johannesburg` vs Mauritius `Indian/Mauritius`; see `docs/examples/poem.yaml`; `default_places: false` drops the defaults). Offsets are matched to places for the date of each message, so daylight saving is respected (`+0000` is Dublin in January but not in July), and every match lists the other countries sharing that offset on that date.
 
 | Signal | How it is obtained | Strength |
 |---|---|---|
-| `Date` offset on the item | Transport headers | weak (desktop) / moderate (mobile client) |
+| `Date` offset on the item | Transport headers, judged by who wrote them: the path (Message-ID format, Exchange headers) and the device (X-Mailer/User-Agent, mobile signatures). Writer classes that emit `+0000` all year in this mailbox are treated as UTC-normalised and their `+0000` is ignored | weak (desktop/service) / moderate (phone with clock check passed) |
+| Clock check | `Date` (device clock and zone) vs the first `Received` timestamp (server clock); whole-hour differences mean a mis-set time zone, and that offset is not used | filter |
+| Phone vs laptop for sent items without headers | Outlook property fingerprints, labelled from sent items whose device is known (signature, or a header copy) | per cluster, with purity |
 | Offset for sent items without headers | Another copy of the same `Message-ID` in the mailbox (cc to self, distribution lists, forwards as attachment) | as above |
 | Replier's client time zone | The quoted `Sent:` / `On … wrote:` line compared with the parent message's UTC time (or the Thread-Index time of the parent), English and French formats | weak |
 | Send-time pattern | Weekly median first send in UTC vs the mailbox baseline; a ~2h earlier shift matches Mauritius | weak, aggregate |
 | Self-statements | "landed in Mauritius", "back in Joburg", "flying to …" in the sender's own text (quoted history is stripped) | moderate / weak |
 | Calendar items | Location text and the time-zone definition stored on appointments; online meetings excluded from location | moderate / weak |
-| Travel and receipts | Itineraries (airport pairs with dates), ride receipts, out-of-office replies | weak / moderate, always queued for verification |
+| Travel and receipts | Boarding passes and check-ins, itineraries (airport pairs with dates), ride receipts, out-of-office replies | moderate (boarding, receipts) / weak (bookings), always queued for verification |
 | Client IPs | `X-Originating-IP`, first `Received` hop; placed only via configured IP ranges, otherwise queued for historical geolocation | moderate when placed |
 | Documents | OOXML core/app properties, tracked-change and comment authors, Word `dateUtc` vs local revision time (editor's time zone), OLE summary info, PDF Info/XMP dates with offsets, e-signature certificates and IPs | weak / per document |
 | Language | Instruction, approval, formality, POEM-awareness, channel-shift, deliberation and privilege phrase lists on authored text only | lead for review |
 | Threads | Message-ID/References plus Outlook Thread-Index; missing thread ancestors are reported with their original time | anomaly |
 | Anomalies | Weeks with no sent mail, Recoverable Items on decision threads, decision documents created before/after the formal date, conflicting location signals | anomaly |
 
-The report (`report/index.html` plus `report/csv/*.csv`) has, per decision, an indicator matrix (counts by home base and by inferred location, never a verdict), a timeline with source path and hash for every row, document metadata and anomalies. It also has the custodian's location calendar, coverage statistics showing how much the mailbox can actually say, and a human review queue (`csv/review_queue.csv`, with empty `reviewer`/`outcome` columns).
+The rules above are measured, not assumed: `docs/ground-truth.md` describes a tagged test mailbox (clients × devices × time zone settings) and `emailforensics groundtruth` scores the tool against it.
+
+The report (`report/index.html` plus `report/csv/*.csv`) has a "Who wrote the Date headers" table, a device and clock-check breakdown, a strength rubric, and, per decision, an indicator matrix (counts by home base and by inferred location, never a verdict), a timeline with source path and hash for every row, document metadata and anomalies. It also has the custodian's location calendar, coverage statistics showing how much the mailbox can actually say, and a human review queue (`csv/review_queue.csv`, with empty `reviewer`/`outcome` columns).
 
 Tests: `pytest`. The database tests run only when `EMAILFORENSICS_TEST_DSN` is set, e.g. `postgresql://emailforensics:emailforensics@127.0.0.1:5432/postgres`.
 

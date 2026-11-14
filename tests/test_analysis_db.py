@@ -9,6 +9,7 @@ from emailforensics.analysis.registers import save_decisions, save_people
 from emailforensics.analysis.run import analyze_case
 from emailforensics.case import create_case
 from emailforensics.ingest.parse import Attachment, MapiFields, parse_message
+from emailforensics.groundtruth import evaluate, load_truth
 from emailforensics.report import build_report
 from emailforensics.store import db, writer
 from test_analysis import _docx
@@ -76,6 +77,12 @@ def load_mailbox(case, tmp_path):
     d = as_sent_item(eml({
         "From": "Jane CFO <cfo@group.example>", "To": "pa@group.example", "Subject": "Travel", "Message-ID": "<d@group.example>",
     }, "Just landed in Mauritius. Back on Friday."), datetime(2023, 6, 20, 9, 0, tzinfo=timezone.utc))
+    gt = parse_message(eml({
+        "Received": "from [10.0.0.9] by mx.group.example; Wed, 21 Jun 2023 06:00:30 +0000",
+        "X-Mailer": "iPhone Mail (20F66)",
+        "From": "Jane CFO <cfo@group.example>", "To": "d2@offshore.example", "Subject": "[GT01] test",
+        "Date": "Wed, 21 Jun 2023 10:00:00 +0400", "Message-ID": "<9A8B7C6D-1111-2222-3333-444455556666@group.example>",
+    }, "test"))
     with db.connect(case.dsn) as conn:
         run = writer.start_run(conn, "test", ["test"], "exec")
         sid = writer.insert_source(conn, run, src, "pst", "0" * 64, "exec")
@@ -85,6 +92,7 @@ def load_mailbox(case, tmp_path):
             writer.NewMessage("pst:3", "c" * 64, c_sent, folder_path=sent, item_state="live"),
             writer.NewMessage("pst:4", c_inbox.sha256, c_inbox, folder_path=inbox, item_state="live"),
             writer.NewMessage("pst:5", "d" * 64, d, folder_path=sent, item_state="recoverable"),
+            writer.NewMessage("pst:6", gt.sha256, gt, folder_path=inbox, item_state="live"),
         ])
         return {r[1]: r[0] for r in conn.execute("SELECT id, item_path FROM message")}
 
@@ -124,8 +132,24 @@ def test_analysis_and_report_end_to_end(case, tmp_path):
         assert {"formality", "geolocate_ip"} <= reasons
         assert conn.execute("SELECT count(*) FROM location_evidence WHERE method = 'statement_present' AND place = 'MU'").fetchone()[0] == 1
 
+    with db.connect(case.dsn) as conn:
+        w, clock, cand = conn.execute(
+            "SELECT writer, clock_check, offset_candidates FROM message_analysis WHERE msg_id = %s", (ids["pst:6"],)).fetchone()
+        assert (w["device"], w["path"], clock) == ("phone", "apple_client", "consistent")
+        assert cand["date"]["place"] == "MU" and cand["date"]["strength"] == "moderate"
+        assert "Seychelles" in cand["date"]["also_consistent_with"] or cand["date"]["also_consistent_count"] > 3
+
+    truth = tmp_path / "truth.yaml"
+    truth.write_text("tests:\n  - tag: GT01\n    client: Apple Mail iPhone\n    device: phone\n"
+                     "    device_timezone: Indian/Mauritius\n    place: MU\n  - tag: GT99\n    client: missing\n", encoding="utf-8")
+    rows, summary = evaluate(case, load_truth(truth))
+    hit = next(r for r in rows if r["tag"] == "GT01")
+    assert (hit["offset_ok"], hit["device_ok"], hit["place_ok"], hit["clock"]) == ("yes", "yes", "yes", "consistent")
+    assert summary["found"] == 1 and any(r.get("copy") == "NOT FOUND" for r in rows)
+
     index, stale = build_report(case, load_settings(None), tmp_path / "report", verify=False)
     assert not stale
+    assert "Who wrote the Date headers" in index.read_text(encoding="utf-8")
     page = index.read_text(encoding="utf-8")
     assert "Stale analysis" not in page
     assert "Acquire Falcon" in page and "Indicator matrix" in page

@@ -70,6 +70,8 @@ class Row:
     thread_key: str | None
     attachments: list[str]
     message_class: str | None
+    candidates: dict | None = None
+    writer: dict | None = None
 
 
 def _counts(values) -> str:
@@ -128,7 +130,7 @@ class ReportData:
             " a.questions, coalesce(length(a.authored_text), 0), left(a.authored_text, 400), m.folder_path,"
             " m.item_state, m.item_path, m.sha256, s.file_name, a.custodian_sent, a.thread_key,"
             " coalesce((SELECT array_agg(coalesce(at.filename, at.mime_path) ORDER BY at.id) FROM attachment at WHERE at.msg_id = m.id), '{}'),"
-            " m.message_class"
+            " m.message_class, a.offset_candidates, a.writer"
             " FROM decision_message dm JOIN message m ON m.id = dm.msg_id"
             " JOIN source_file s ON s.id = m.source_file_id"
             " LEFT JOIN message_analysis a ON a.msg_id = m.id"
@@ -141,6 +143,7 @@ class ReportData:
                 place_strength=r[10], roles=list(r[11] or []), phrases=r[12] or {}, questions=r[13] or 0, authored_len=r[14],
                 excerpt=(r[15] or "").replace("\n", " "), folder=r[16], item_state=r[17], item_path=r[18], sha256=r[19],
                 source_file=r[20], custodian_sent=bool(r[21]), thread_key=r[22], attachments=list(r[23]), message_class=r[24],
+                candidates=(r[25] or {}).get("date"), writer=r[26],
             ))
         return out
 
@@ -208,6 +211,19 @@ class ReportData:
         c["item_states"] = dict(self.conn.execute(
             "SELECT coalesce(item_state, 'n/a'), count(*) FROM message GROUP BY 1").fetchall())
         c["mobile_sent"] = self.conn.execute("SELECT count(*) FROM message_analysis WHERE custodian_sent AND mobile").fetchone()[0]
+        c["sent_devices"] = self.conn.execute(
+            "SELECT coalesce(writer->>'device', 'unknown'), count(*),"
+            " count(*) FILTER (WHERE writer::text LIKE '%%property fingerprint%%')"
+            " FROM message_analysis WHERE custodian_sent GROUP BY 1 ORDER BY 2 DESC").fetchall()
+        c["clock"] = self.conn.execute(
+            "SELECT coalesce(clock_check, 'no headers'), count(*) FILTER (WHERE custodian_sent OR sender_person IS NOT NULL),"
+            " count(*) FROM message_analysis GROUP BY 1 ORDER BY 3 DESC").fetchall()
+        c["uninformative"] = self.conn.execute(
+            "SELECT count(*) FROM message_analysis WHERE custodian_sent"
+            " AND (offset_candidates->'date'->>'informative')::boolean IS FALSE").fetchone()[0]
+        c["places_by_year"] = self.conn.execute(
+            "SELECT extract(year FROM sent_utc)::int, coalesce(place, 'none'), count(*) FROM message_analysis"
+            " WHERE custodian_sent AND sent_utc IS NOT NULL GROUP BY 1, 2 ORDER BY 1, 3 DESC").fetchall()
         return c
 
 
@@ -291,6 +307,8 @@ details summary{cursor:pointer;color:var(--accent)}
 
 
 def _place(p: str | None) -> str:
+    if p == "OTHER":
+        return '<span class="note"><b>other</b> (offset matches no configured place)</span>'
     return f'<span class="{esc(p)}">{esc(p)}</span>' if p else '<span class="note">unknown</span>'
 
 
@@ -366,8 +384,9 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
         now = datetime.now(timezone.utc)
         parts.append(f"<h1>POEM email evidence: {esc(case.name)}</h1>")
         parts.append(f'<p class="lede">Generated {fmt_dt(now)} UTC · emailforensics {esc(__version__)} · analysis run {data.run["id"]}'
-                     f' · config sha256 <code>{esc(data.run["config_sha256"][:16])}</code></p>')
-        parts.append('<div class="banner"><b>This report collects evidence; it does not decide POEM.</b> Location signals are '
+                     f' · config sha256 <code>{esc(data.run["config_sha256"][:16])}</code>'
+                     f' · tzdata {esc((data.run["stats"] or {}).get("tzdata_version", "?"))}</p>')
+        parts.append('<div class="banner"><b>This report collects evidence; it does not decide POEM.</b> Time zone and place signals are '
                      'indicators of varying strength, phrase tags are leads to read, and the matrices are counts, not scores. '
                      'Every row traces to a source file, an item path and a hash. Conclusions need a tax adviser weighing all '
                      'decisions, all evidence and the applicable law.</div>')
@@ -376,6 +395,7 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
                          'last analysis run, so decision links and locations below may be missing or out of date. '
                          'Run <code>emailforensics analyze</code> again.</div>')
         nav = ['<a href="#integrity">Integrity</a>', '<a href="#coverage">What this mailbox can show</a>',
+               '<a href="#writers">Date writers</a>', '<a href="#strength">Strength grades</a>',
                '<a href="#people">People</a>', '<a href="#location">Custodian location</a>']
         nav += [f'<a href="#d-{esc(d["id"])}">{esc(d["id"])}</a>' for d in data.decisions]
         nav += ['<a href="#anomalies">Anomalies</a>', '<a href="#review">Human review</a>', '<a href="#limits">Limitations</a>']
@@ -398,7 +418,8 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
             (f"{sent:,}", "items sent by the custodian"),
             (f"{(with_offset / sent * 100 if sent else 0):.0f}%", "of sent items with any time zone offset"),
             (f"{(located / sent * 100 if sent else 0):.0f}%", "of sent items with a location signal"),
-            (f"{cov['mobile_sent']:,}", "sent from a mobile client"),
+            (f"{cov['mobile_sent']:,}", "sent from a phone or tablet"),
+            (f"{cov['uninformative']:,}", "sent-item offsets judged uninformative"),
             (f"{cov['attachments_meta']:,}/{cov['attachments']:,}", "attachments with document metadata"),
             (f"{cov['esign']:,}", "e-signature audit trails"),
         ]
@@ -411,12 +432,53 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
         parts.append("<h3>Offsets seen on the custodian's sent items (minutes from UTC)</h3>")
         parts.append(_table(["Offset", "Items"], [[esc(fmt_off(int(k)) if k != "none" else "none"), f"{v:,}"] for k, v in cov["sent_offset_values"].items()]))
         if with_offset and cov["sent_offset_values"].get("0", 0) > with_offset / 2:
-            parts.append('<div class="banner">Most offsets on sent items are +0000. That usually means the Date header was written by '
-                         'the mail server (common with Exchange Online), so it says nothing about the sender\'s location.</div>')
+            parts.append('<div class="banner">Most offsets on sent items are +0000. Check the Date writers table below: where a '
+                         'writer shows +0000 in both halves of the year it is UTC normalisation, not a location.</div>')
         parts.append("<h3>Offsets on received mail (other senders)</h3>")
         parts.append(_table(["Offset", "Items"], [[esc(fmt_off(int(k)) if k != "none" else "none"), f"{v:,}"] for k, v in cov["received_offsets"].items()]))
         parts.append("<h3>Location evidence collected</h3>")
         parts.append(_table(["Method", "Place", "Strength", "Count"], [[esc(a), _place(b if b != "?" else None), esc(c), f"{n:,}"] for a, b, c, n in cov["evidence_methods"]]))
+
+        stats_run = data.run["stats"] or {}
+        parts.append('<h2 id="writers">Who wrote the Date headers</h2>')
+        parts.append('<p class="note">Each Date header is classified by the software path that wrote it (from the Message-ID '
+                     'format and Exchange headers) and the device (from X-Mailer/User-Agent, mobile signatures, and, for sent '
+                     'items without headers, Exchange ClientInfo or Outlook property fingerprints). A writer class is '
+                     '"UTC-normalised" when it writes +0000 on dates when no configured place is on +0000 (for example '
+                     'Irish summer time, or any date for South Africa/Mauritius): at least 20% of such items for a known '
+                     'person, 50% for a class pooling many senders. Its +0000 offsets are then ignored, including in winter. '
+                     'Classes with too few such dates fall back to +0000 on 90% of 20+ items across the year. '
+                     'These rules are measured on this mailbox, not assumed.</p>')
+        profiles = stats_run.get("writer_profiles") or {}
+        ordered = sorted(profiles.items(), key=lambda kv: ("|" not in kv[0], -kv[1]["messages"]))
+        parts.append(_table(["Writer class (person | path/device)", "Items", "+0000 share",
+                             "+0000 when no configured place is on +0000", "Most common offsets", "Verdict"],
+                            [[esc(k), f"{v['messages']:,}", f"{v['zero_share']:.0%}",
+                              (f"{v['off_zone_zero_share']:.0%} of {v['off_zone_items']:,}" if v.get("off_zone_items") else "n/a"),
+                              esc(", ".join(f"{fmt_off(o)}×{n}" for o, n in v["top_offsets"])),
+                              (f"<b>UTC-normalised ({esc(v.get('rule', ''))}): +0000 ignored</b>" if v["utc_normalised"] else "offsets kept")]
+                             for k, v in ordered]))
+        parts.append("<h3>Devices behind the custodian's sent items</h3>")
+        parts.append(_table(["Device", "Items", "of which inferred from property fingerprint"],
+                            [[esc(d), f"{n:,}", f"{f:,}"] for d, n, f in cov["sent_devices"]]))
+        fc = stats_run.get("fingerprint_clusters") or {}
+        if fc:
+            parts.append(f'<p class="note">Property fingerprints: {fc.get("clusters", 0):,} clusters among header-less sent items, '
+                         f'{fc.get("labelled_clusters", 0):,} labelled (at least 3 known items, at least 80% agreeing), '
+                         f'{fc.get("items_labelled_by_cluster", 0):,} items labelled this way.</p>')
+        parts.append("<h3>Device clock vs first server clock</h3>")
+        parts.append('<p class="note">The Date header (device clock and time zone) is compared with the timestamp of the first '
+                     'Received header (server clock). "whole_hours_off" means the device\'s time zone setting did not match its clock, '
+                     'so its offset is not used.</p>')
+        parts.append(_table(["Result", "Custodian and known people", "All items"], [[esc(k), f"{a:,}", f"{b:,}"] for k, a, b in cov["clock"]]))
+        qv = stats_run.get("quoted_vs_date") or {}
+        if qv.get("both_placed"):
+            parts.append(f'<p class="note">Cross-check: {qv["both_placed"]:,} items have both a Date-header place and a quoted-reply place; '
+                         f'they agree on {qv["agree"]:,} ({qv["agree"] / qv["both_placed"]:.0%}). '
+                         f'{esc(", ".join(f"{k}: {v}" for k, v in qv.get("pairs", {}).items()))}</p>')
+
+        parts.append('<h2 id="strength">How strength is graded</h2>')
+        parts.append(_table(["Signal", "Strength", "Why"], [[esc(a), esc(b), esc(c)] for a, b, c in STRENGTH_RUBRIC]))
 
         parts.append('<h2 id="people">People register</h2>')
         parts.append(_table(["ID", "Name", "Base", "Role", "Board", "Custodian", "Addresses"],
@@ -447,6 +509,14 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
               esc(w["shift_min"]), _place(w["place"]) if w["shift_min"] is not None else '<span class="note">too few days</span>'] for w in weeks]) + "</details>")
         _write_csv(csv_dir / "sendtime_weeks.csv", ["week_start", "days", "messages", "median_first_utc", "median_last_utc", "shift_min", "place"],
                    [[w["week_start"], w["days"], w["messages"], hhmm(w["median_first_min"]), hhmm(w["median_last_min"]), w["shift_min"], w["place"]] for w in weeks])
+        years: dict[int, Counter] = defaultdict(Counter)
+        for y, pl, n in cov["places_by_year"]:
+            years[y][pl] += n
+        if years:
+            parts.append("<h3>Custodian's sent items by year and time zone signal</h3>")
+            parts.append(_table(["Year", "Signals (sent items)"],
+                                [[str(y), " · ".join(f"{_place(p) if p != 'none' else 'none'} {n:,}" for p, n in c.most_common())]
+                                 for y, c in sorted(years.items())]))
         ev = data.evidence(cust_id)
         parts.append("<h3>Presence evidence for the custodian</h3>")
         firm = [e for e in ev if e["method"] not in ("send_time_pattern",) and not e["method"].startswith("tz_")]
@@ -486,6 +556,15 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
                     phase = "before" if day < formal else "formal day" if day == formal else "after"
                 roles = "".join(f'<span class="pill">{esc(x)}</span>' for x in r.roles)
                 where = _place(r.place) + (f' <span class="note {esc(r.place_strength)}">{esc(r.place_method)}, {esc(r.place_strength)}</span>' if r.place else "")
+                if r.candidates:
+                    alts = r.candidates.get("also_consistent_with") or []
+                    more = (r.candidates.get("also_consistent_count") or 0) - len(alts)
+                    if not r.candidates.get("informative", True):
+                        where += '<br><span class="note">offset ignored: ' + esc("; ".join(r.candidates.get("reasons") or [])) + "</span>"
+                    elif alts:
+                        where += '<br><span class="note">offset also consistent with ' + esc(", ".join(alts)) + (f" and {more} more" if more > 0 else "") + "</span>"
+                if r.writer and r.writer.get("device") not in (None, "unknown"):
+                    where += f'<br><span class="note">device: {esc(r.writer["device"])}</span>'
                 who = esc(r.sender_person or r.sender) + (f" ({_place(r.sender_base)})" if r.sender_base else "")
                 trows.append([
                     fmt_dt(r.at), esc(fmt_off(r.offset)) + (f'<br><span class="note">{esc(r.offset_method)}</span>' if r.offset_method else ""),
@@ -493,7 +572,7 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
                     "<br>".join(esc(a) for a in r.attachments[:6]),
                     f'<span class="mono">{esc(r.source_file)}:{esc(r.item_path)}<br>{esc(r.sha256[:16])}…</span>' + (f'<br><b>{esc(r.item_state)}</b>' if r.item_state and r.item_state != "live" else ""),
                 ])
-            parts.append(_table(["UTC", "Offset", "Phase", "Sender (base)", "Sender location", "Tags", "Subject / authored text", "Attachments", "Source"], trows))
+            parts.append(_table(["UTC", "Offset", "Phase", "Sender (base)", "Time zone / place signal", "Tags", "Subject / authored text", "Attachments", "Source"], trows))
             _write_csv(csv_dir / f"timeline_{d['id']}.csv",
                        ["utc", "offset", "offset_method", "sender", "sender_person", "sender_base", "place", "place_method", "place_strength",
                         "roles", "phrases", "subject", "folder", "item_state", "source_file", "item_path", "sha256", "msg_id", "link_reasons"],
@@ -546,9 +625,34 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
     return index, data.stale
 
 
+STRENGTH_RUBRIC = [
+    ("Date offset, phone or tablet client, clock consistent with server", "moderate",
+     "Phones normally set their time zone from the network; the clock check rules out a mis-set zone."),
+    ("Date offset, desktop or unknown client", "weak",
+     "Laptops often keep their home time zone when travelling; the offset reflects a setting."),
+    ("Date offset written by a mail service", "weak",
+     "Reflects the account or browser time zone setting, or UTC normalisation (then ignored)."),
+    ("+0000 from a UTC-normalised writer class", "none (ignored)", "Measured in this mailbox: the writer emits +0000 all year."),
+    ("Date offset with the device clock whole hours off the server clock", "none (ignored)",
+     "The device's time zone did not match its clock, so the offset is not a reliable setting."),
+    ("Quoted reply header time zone", "weak", "Display setting of the replier's mail client."),
+    ("Offset recovered from another copy (cc to self, distribution list)", "same as the copy", "Same Date header, so same writer and clock."),
+    ("Self-statement ('landed in…', 'back in…')", "moderate", "The person's own words at that time; can be wrong or joking."),
+    ("Calendar location (not an online meeting)", "moderate", "Where a meeting was set; attendance in person is not proven."),
+    ("Calendar time zone", "weak", "The organiser's calendar setting."),
+    ("Boarding pass / check-in confirmation", "moderate", "Shows the trip was under way; the passenger needs confirming."),
+    ("Itinerary / booking", "weak", "Shows a plan; the trip may not have happened."),
+    ("Ride receipt", "moderate", "Shows a ride in that city; the rider needs confirming."),
+    ("Client IP in a configured range", "moderate", "Depends on the range list; VPNs and roaming can mislead."),
+    ("Weekly send-time pattern", "weak, only if validated", "Aggregate; used only when it agrees with the person's own offsets."),
+    ("Offset matching a place", "never unique",
+     "Every offset is shared by other countries on that date; the timeline lists them. A place label means 'consistent with', not 'was in'."),
+]
+
+
 LIMITATIONS = [
     "One mailbox shows one person's view. Other directors' mailboxes, the company secretary's files, calls, meetings, WhatsApp and Teams chats are not in it. Absence of evidence here is not evidence of absence.",
-    "Time zone offsets reflect a device or client setting, not a location. Laptops often keep their home zone when travelling; servers often write +0000.",
+    "Time zone offsets reflect a device, account or client setting, not a location, and each offset is shared by many countries on any given date. Laptops often keep their home zone when travelling. Whether a writer emits +0000 is measured per mailbox (see Date writers), not assumed.",
     "Sent items in a PST usually have no Date header. Offsets for them are recovered only where another copy or a quoted reply header exists.",
     "Server IP addresses in Received headers (Microsoft, Google) describe the provider's infrastructure, not the sender. A tenant hosted in South African data centres can make every message look South African.",
     "Send-time patterns are aggregate and weak. Two hours is a small shift; short trips usually do not show.",
