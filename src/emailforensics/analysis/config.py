@@ -4,13 +4,13 @@ import copy
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from functools import cached_property
 from pathlib import Path
 
 import yaml
 
-from emailforensics.analysis.zones import OffsetMatch, ZoneIndex
+from emailforensics.analysis.zones import OffsetMatch, ZoneIndex, offset_at
 
 DEFAULT_PLACES: dict[str, dict] = {
     "ZA": {
@@ -97,7 +97,8 @@ DEFAULT_SETTINGS = {
     "quoted_header": {"max_residual_min": 4},
     "anomaly": {"gap_min_weekly": 10},
     "writer_profile": {"min_messages": 20, "min_zero_share": 0.9, "min_per_half_year": 5, "min_off_zone": 10,
-                       "min_off_zone_zero_share": 0.2, "min_off_zone_zero_share_pooled": 0.5},
+                       "min_off_zone_zero_share": 0.2, "min_off_zone_zero_share_pooled": 0.5,
+                       "utc_reference_zones": ["Europe/London"]},
     "fingerprint": {"min_labelled": 3, "min_purity": 0.8},
     "privilege_domains": [],
     "excluded_folders": ["Junk Email", "Deleted Items/Junk", "Spam", "RSS Feeds", "Sync Issues"],
@@ -158,7 +159,8 @@ class Settings:
 
     @cached_property
     def zone_index(self) -> ZoneIndex:
-        return ZoneIndex({p.code: (tuple(p.zones), tuple(p.offsets)) for p in self.places.values()})
+        return ZoneIndex({p.code: (tuple(p.zones), tuple(p.offsets)) for p in self.places.values()},
+                         utc_reference=tuple(self.writer_profile.get("utc_reference_zones") or ()))
 
     def offset_match(self, minutes: int | None, at: datetime | date | None) -> OffsetMatch | None:
         if minutes is None or at is None:
@@ -223,6 +225,14 @@ def load_settings(path: Path | None) -> Settings:
         )
         for code, p in places_raw.items()
     }
+    probe = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    for p in places.values():
+        bad = [z for z in p.zones if offset_at(z, probe) is None]
+        if bad:
+            raise ValueError(f"place {p.code}: unknown time zone {', '.join(bad)} (use IANA names such as Indian/Mauritius)")
+    bad = [z for z in settings_raw["writer_profile"].get("utc_reference_zones") or () if offset_at(z, probe) is None]
+    if bad:
+        raise ValueError(f"writer_profile.utc_reference_zones: unknown time zone {', '.join(bad)}")
     raw = {"places": places_raw, "phrases": phrases_raw, "default_places": data.get("default_places", True), **settings_raw}
     return Settings(
         places=places,

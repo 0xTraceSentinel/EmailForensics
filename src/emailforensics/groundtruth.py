@@ -25,9 +25,13 @@ class Test:
 
 def load_truth(path: Path) -> list[Test]:
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    rows = data.get("tests", data) if isinstance(data, dict) else data
+    rows = data.get("tests") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        raise ValueError(f"{path}: expected a 'tests:' list of entries (see docs/examples/truth.yaml)")
     out = []
-    for r in rows:
+    for i, r in enumerate(rows, 1):
+        if not isinstance(r, dict) or not r.get("tag"):
+            raise ValueError(f"{path}: test {i} must be a mapping with at least a 'tag'")
         out.append(Test(
             tag=str(r["tag"]),
             client=str(r.get("client", "")),

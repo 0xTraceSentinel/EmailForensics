@@ -25,6 +25,11 @@ STRENGTH_RANK = {"strong": 3, "moderate": 2, "weak": 1}
 OTHER = "OTHER"
 
 
+def _utc(value: str) -> datetime:
+    at = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    return at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at.astimezone(timezone.utc)
+
+
 def _day_bounds(d: date) -> tuple[datetime, datetime]:
     start = datetime.combine(d, time(0), tzinfo=timezone.utc)
     return start, start + timedelta(days=1)
@@ -484,19 +489,21 @@ class Analyzer:
         for key, rows in groups.items():
             n = len(rows)
             zero = sum(1 for _, o in rows if o == 0)
-            off_zone = [o for t, o in rows if not zi.any_place_at(0, t)]
+            off_zone = [o for t, o in rows if not zi.utc_is_local_at(t)]
             off_zone_zero = sum(1 for o in off_zone if o == 0)
             north_summer = sum(1 for t, _ in rows if 4 <= t.month <= 9)
             if len(off_zone) >= cfg["min_off_zone"]:
                 threshold = cfg["min_off_zone_zero_share"] if "|" in key else cfg.get("min_off_zone_zero_share_pooled", 0.5)
                 normalised = off_zone_zero / len(off_zone) >= threshold
                 rule = "seasonal"
+                profiled = True
             else:
                 normalised = (n >= cfg["min_messages"] and zero / n >= cfg["min_zero_share"]
                               and north_summer >= cfg["min_per_half_year"] and n - north_summer >= cfg["min_per_half_year"])
                 rule = "all-year"
+                profiled = n >= cfg["min_messages"] and north_summer >= cfg["min_per_half_year"] and n - north_summer >= cfg["min_per_half_year"]
             self.writer_profiles[key] = {
-                "messages": n, "zero_share": round(zero / n, 3), "utc_normalised": normalised, "rule": rule,
+                "messages": n, "zero_share": round(zero / n, 3), "utc_normalised": normalised, "rule": rule, "profiled": profiled,
                 "off_zone_items": len(off_zone), "off_zone_zero_share": round(off_zone_zero / len(off_zone), 3) if off_zone else None,
                 "top_offsets": Counter(o for _, o in rows).most_common(6),
                 "apr_sep": north_summer, "oct_mar": n - north_summer,
@@ -518,8 +525,9 @@ class Analyzer:
         if off == 0 and prof and prof["utc_normalised"]:
             informative = False
             if prof["rule"] == "seasonal":
-                reasons.append(f"{key} writes +0000 on {prof['off_zone_zero_share']:.0%} of {prof['off_zone_items']} items dated when no "
-                               "configured place is on +0000 (e.g. Irish summer time): UTC normalisation or a client set to UTC, not a location")
+                reasons.append(f"{key} writes +0000 on {prof['off_zone_zero_share']:.0%} of {prof['off_zone_items']} items dated when neither "
+                               "a configured place nor the UTC reference zone (Europe/London by default) is on +0000: "
+                               "UTC normalisation or a client set to UTC, not a location")
             else:
                 reasons.append(f"{key} shows +0000 on {prof['zero_share']:.0%} of {prof['messages']} items across both halves of the year: "
                                "UTC written by a server or a client set to UTC, not a location")
@@ -527,8 +535,15 @@ class Analyzer:
             reasons.append("+0000 from a mail service; could be UTC normalisation rather than local time")
         if not quoted and r.clock_check == "whole_hours_off":
             informative = False
-            reasons.append(f"Date is {r.clock_skew} min from the first server's clock: the device's time zone setting does not match its clock")
+            reasons.append(f"Date is {-r.clock_skew} min after the first server received it: the device's time zone setting does not match its clock")
+        elif not quoted and r.clock_check == "whole_hours_late":
+            reasons.append(f"first server received it {r.clock_skew} min after its Date: either a send delayed by whole hours "
+                           "(offline draft, outbox queue) or a device time zone that does not match its clock; offset kept as weak")
         place = match.places[0] if informative and len(match.places) == 1 else None
+        if off == 0 and informative and not (prof and prof.get("profiled")):
+            reasons.append("+0000 from a writer class with too few dated items to tell local time from UTC normalisation")
+        other = (informative and not match.places
+                 and (off != 0 or (bool(prof and prof.get("profiled")) and not quoted and w.get("date_by") != "service")))
         strength = "weak"
         if place and not quoted and w.get("device") in ("phone", "tablet") and r.clock_check == "consistent":
             strength = "moderate"
@@ -537,7 +552,7 @@ class Analyzer:
             reasons.append("offset written by the mail service from the account/browser time zone setting")
         if quoted:
             reasons.append("display time zone of the replier's mail client")
-        return {"offset": off, "method": method, **match.json(), "informative": informative, "place": place,
+        return {"offset": off, "method": method, **match.json(), "informative": informative, "place": place, "other": other,
                 "strength": strength, "writer_class": key, "clock": None if quoted else r.clock_check, "reasons": reasons}
 
     def judge_offsets(self) -> None:
@@ -643,7 +658,7 @@ class Analyzer:
             j = r.offset_candidates
             if j and j["place"]:
                 own.append((j["place"], r.offset_method, j["strength"]))
-            elif j and j["informative"] and not j["places"]:
+            elif j and j.get("other"):
                 own.append((OTHER, r.offset_method, j["strength"]))
             for ip in r.client_ips:
                 if ip["place"]:
@@ -660,8 +675,8 @@ class Analyzer:
                 continue
             best = max(options, key=lambda o: (STRENGTH_RANK[o[2]], o in own, o[1] != "send_time_pattern"))
             r.place, r.place_method, r.place_strength = best
-            firm = {o[0] for o in options if STRENGTH_RANK[o[2]] >= 2}
-            direct = {o[0] for o in own} | firm
+            firm = {o[0] for o in options if STRENGTH_RANK[o[2]] >= 2 and o[0] != OTHER}
+            direct = {o[0] for o in own if o[0] != OTHER} | firm
             if (r.sender_person or r.custodian_sent) and (len(firm) > 1 or (len(direct) > 1 and m.parent_id is None)):
                 self.anomalies.append({"kind": "location_conflict", "msg_id": m.id, "at_utc": when,
                                        "detail": {"person": who, "signals": [{"place": o[0], "method": o[1], "strength": o[2]} for o in options]}})
@@ -703,7 +718,7 @@ class Analyzer:
                 ed_at = None
                 if ed.get("last"):
                     try:
-                        ed_at = datetime.fromisoformat(ed["last"].replace("Z", "")).replace(tzinfo=timezone.utc)
+                        ed_at = _utc(ed["last"])
                     except ValueError:
                         ed_at = None
                 for off in ed.get("offsets", []):
@@ -713,7 +728,7 @@ class Analyzer:
                         pid = self.by_name.get(ed["author"].strip().lower())
                         if ed.get("last"):
                             try:
-                                at = datetime.fromisoformat(ed["last"].replace("Z", "")).replace(tzinfo=timezone.utc)
+                                at = _utc(ed["last"])
                                 self.evidence.append(Evidence(pid or f"author:{ed['author']}", None, "tz_document_revision", pl, at, at, "weak",
                                                               {"sha256": sha, "filename": filename, "offset_minutes": off}))
                             except ValueError:
@@ -855,7 +870,7 @@ class Analyzer:
                 for reason in ("formality", "poem_awareness", "channel_shift"):
                     if reason in r.roles:
                         self.reviews.append({"reason": reason, "decision_id": d.id, "msg_id": mid, "detail": {"phrases": r.phrases.get(reason)}})
-                if r.place is None and self.lite[mid].parent_id is None and (r.custodian_sent or r.sender_person):
+                if r.place in (None, OTHER) and self.lite[mid].parent_id is None and (r.custodian_sent or r.sender_person):
                     self.reviews.append({"reason": "no_location_signal", "decision_id": d.id, "msg_id": mid, "detail": {"sender": r.sender_address}})
                 if r.sender_person is None and r.sender_address:
                     u = unmapped.setdefault(r.sender_address, {"sender": r.sender_address, "messages": 0, "first_msg_id": mid})

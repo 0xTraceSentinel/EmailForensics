@@ -71,6 +71,16 @@ def _load_case(case_dir: Path) -> Case:
         raise typer.Exit(1)
 
 
+def _settings(config: Optional[Path]):
+    from emailforensics.analysis.config import load_settings
+
+    try:
+        return load_settings(config)
+    except (ValueError, KeyError, TypeError) as e:
+        typer.echo(f"error: {config}: {e}", err=True)
+        raise typer.Exit(1)
+
+
 ConfigOption = Annotated[
     Optional[Path],
     typer.Option("--config", help="poem.yaml with places, offsets, IP ranges, entities and phrase lists (defaults: ZA vs MU)."),
@@ -116,11 +126,10 @@ def analyze(
     case_dir: Annotated[Path, typer.Argument(help="Case folder.")],
     config: ConfigOption = None,
 ) -> None:
-    from emailforensics.analysis.config import load_settings
     from emailforensics.analysis.run import analyze_case
 
     case = _load_case(case_dir)
-    stats = analyze_case(case, load_settings(config), argv=sys.argv, log=lambda s: typer.echo(s, err=True))
+    stats = analyze_case(case, _settings(config), argv=sys.argv, log=lambda s: typer.echo(s, err=True))
     for k, v in stats.items():
         typer.echo(f"{k}: {v}")
 
@@ -146,11 +155,11 @@ def report(
     config: ConfigOption = None,
     verify: Annotated[bool, typer.Option("--verify/--no-verify", help="Re-hash source files before reporting.")] = True,
 ) -> None:
-    from emailforensics.analysis.config import load_settings
     from emailforensics.report import build_report
 
+    settings = _settings(config)
     try:
-        path, stale = build_report(_load_case(case_dir), load_settings(config), out, verify=verify)
+        path, stale = build_report(_load_case(case_dir), settings, out, verify=verify)
     except RuntimeError as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(1)
@@ -172,7 +181,7 @@ def groundtruth(
 
     try:
         rows, summary = evaluate(_load_case(case_dir), load_truth(truth))
-    except (RuntimeError, KeyError) as e:
+    except (RuntimeError, KeyError, ValueError) as e:
         typer.echo(f"error: {e}", err=True)
         raise typer.Exit(1)
     write_csv(rows, out)

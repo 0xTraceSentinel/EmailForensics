@@ -79,7 +79,7 @@ For each copy of each test email, `groundtruth.csv` shows:
 
 - `offset` vs `expected_offset`: `offset_ok` is `yes` when the Date header carried the device's offset, `UTC` when it carried +0000 instead (the writer normalised it), `no` otherwise.
 - `writer_device` vs `expected_device`: whether X-Mailer, signatures or property fingerprints identified the device correctly.
-- `clock`: the clock check; test 3 above should show `whole_hours_off`.
+- `clock`: the clock check; test 3 above should show `whole_hours_off` (the Date is whole hours after the server received it). The reverse setting (zone Mauritius, clock on Johannesburg time) shows `whole_hours_late`, which cannot be told apart from a send delayed by whole hours, so the tool keeps that offset as weak instead of discarding it.
 - `place` vs `expected_place`.
 
 The summary line `utc_by_client` lists which client/copy combinations wrote +0000. Those findings, with this CSV as the exhibit, are what the case report can cite when it says a given +0000 is uninformative. Keep the CSV, the truth file and the PST hashes with the case file.

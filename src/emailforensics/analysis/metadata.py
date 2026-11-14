@@ -277,7 +277,7 @@ def clock_check(date_utc: datetime | None, headers: list[dict], tolerance_min: f
         return "consistent", round(skew)
     hours = round(skew / 60)
     if hours and abs(skew - hours * 60) <= tolerance_min and abs(hours) <= 14:
-        return "whole_hours_off", round(skew)
+        return ("whole_hours_off" if skew < 0 else "whole_hours_late"), round(skew)
     return ("delayed" if skew > 0 else "device_clock_ahead"), round(skew)
 
 

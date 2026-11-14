@@ -275,7 +275,8 @@ def test_clock_check_flags_whole_hour_skew():
     d = datetime(2023, 6, 14, 7, 15, tzinfo=timezone.utc)
     rcv = lambda s: [{"name": "Received", "value": "from x by y; " + s}]
     assert metadata.clock_check(d, rcv("Wed, 14 Jun 2023 07:15:40 +0000")) == ("consistent", 1)
-    assert metadata.clock_check(d, rcv("Wed, 14 Jun 2023 11:16:00 +0200")) == ("whole_hours_off", 121)
+    assert metadata.clock_check(d, rcv("Wed, 14 Jun 2023 11:16:00 +0200")) == ("whole_hours_late", 121)
+    assert metadata.clock_check(d, rcv("Wed, 14 Jun 2023 05:16:00 +0000")) == ("whole_hours_off", -119)
     assert metadata.clock_check(d, rcv("Wed, 14 Jun 2023 08:01:00 +0000"))[0] == "delayed"
     assert metadata.clock_check(d, [])[0] is None
 
@@ -318,3 +319,102 @@ def test_offset_matching_is_exact_on_clock_change_day(tmp_path):
     after = datetime(2023, 10, 29, 1, 30, tzinfo=timezone.utc)
     assert s.place_for_offset(60, before) == "IE" and s.place_for_offset(0, before) is None
     assert s.place_for_offset(60, after) is None and s.place_for_offset(0, after) == "IE"
+
+
+def _analyzer(rows, person="ie", writer=None):
+    from types import SimpleNamespace
+
+    from emailforensics.analysis.config import Person
+    from emailforensics.analysis.run import Analyzer, Result
+
+    a = Analyzer(None, None, SETTINGS, lambda s: None)
+    a.people[person] = Person(person, None, [], [], "IE", None, False, False)
+    for i, (at, off) in enumerate(rows, 1):
+        a.lite[i] = SimpleNamespace(id=i, date_utc=at, parent_id=None)
+        a.results[i] = Result(msg_id=i, sender_person=person, sent_utc=at, offset_minutes=off, offset_method="date_header",
+                              writer=writer or {"path": "apple_client", "device": "phone", "date_by": "client"},
+                              clock_check="consistent")
+    a.profile_writers()
+    return a
+
+
+def test_utc_zone_sender_is_not_flagged_as_normalised_with_za_mu_places():
+    rows = []
+    for month in range(1, 13):
+        at = datetime(2023, month, 15, 9, tzinfo=timezone.utc)
+        rows += [(at, 60 if 4 <= month <= 9 else 0)] * 2
+    a = _analyzer(rows)
+    prof = a.writer_profiles["ie|apple_client/phone"]
+    assert prof["utc_normalised"] is False and prof["profiled"] is True
+    winter = a.judge(a.results[1], 0, "date_header", rows[0][0])
+    assert winter["informative"] and winter["place"] is None and winter["other"] is True
+
+
+def test_utc_normalising_writer_is_still_caught():
+    rows = [(datetime(2023, m, 15, 9, tzinfo=timezone.utc), 0) for m in range(1, 13) for _ in range(2)]
+    a = _analyzer(rows)
+    j = a.judge(a.results[1], 0, "date_header", rows[0][0])
+    assert a.writer_profiles["ie|apple_client/phone"]["utc_normalised"] is True
+    assert j["informative"] is False and j["other"] is False
+
+
+def test_unprofiled_or_service_zero_offset_is_not_other():
+    rows = [(datetime(2023, 7, 15, 9, tzinfo=timezone.utc), 0)] * 3
+    a = _analyzer(rows, writer={"path": "exchange", "device": "unknown", "date_by": "service"})
+    j = a.judge(a.results[1], 0, "date_header", rows[0][0])
+    assert j["place"] is None and j["other"] is False
+    assert a.judge(a.results[1], 480, "date_header", rows[0][0])["other"] is True
+
+
+def test_whole_hours_late_keeps_offset_as_weak():
+    at = datetime(2023, 7, 15, 9, tzinfo=timezone.utc)
+    a = _analyzer([(at, 120)])
+    r = a.results[1]
+    r.clock_check, r.clock_skew = "whole_hours_late", 120
+    j = a.judge(r, 120, "date_header", at)
+    assert j["informative"] and j["place"] == "ZA" and j["strength"] == "weak"
+    r.clock_check, r.clock_skew = "whole_hours_off", -120
+    assert a.judge(r, 120, "date_header", at)["informative"] is False
+
+
+def test_unknown_place_zone_is_rejected(tmp_path):
+    import pytest
+
+    from emailforensics.analysis.config import load_settings as ls
+
+    cfg = tmp_path / "bad.yaml"
+    cfg.write_text("places:\n  MU:\n    zones: [Indian/Mauritus]\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Indian/Mauritus"):
+        ls(cfg)
+
+
+def test_alternatives_survive_without_country_tables(monkeypatch):
+    from emailforensics.analysis import zones
+
+    world = tuple((z, "") for z, _ in zones._world())
+    monkeypatch.setattr(zones, "_world", lambda: world)
+    zi = zones.ZoneIndex({"ZA": (("Africa/Johannesburg",), ())})
+    m = zi.match(120, datetime(2023, 1, 10, 12, tzinfo=timezone.utc))
+    assert m.places == ("ZA",) and m.alternative_count > 0 and "Africa/Johannesburg" not in m.alternatives
+
+
+def test_editor_timestamps_keep_their_offset():
+    from emailforensics.analysis.run import _utc
+
+    assert _utc("2021-03-28T01:30:00+02:00") == datetime(2021, 3, 27, 23, 30, tzinfo=timezone.utc)
+    assert _utc("2021-03-28T01:30:00Z") == datetime(2021, 3, 28, 1, 30, tzinfo=timezone.utc)
+    assert _utc("2021-03-28T01:30:00") == datetime(2021, 3, 28, 1, 30, tzinfo=timezone.utc)
+
+
+def test_truth_file_shape_is_validated(tmp_path):
+    import pytest
+
+    from emailforensics.groundtruth import load_truth
+
+    bad = tmp_path / "truth.yaml"
+    bad.write_text("T1:\n  client: Outlook\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="tests"):
+        load_truth(bad)
+    good = tmp_path / "ok.yaml"
+    good.write_text("tests:\n  - tag: GT01\n    place: za\n", encoding="utf-8")
+    assert load_truth(good)[0].place == "ZA"

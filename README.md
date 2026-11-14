@@ -54,7 +54,7 @@ Known PST limits (libpff): an embedded message (e.g. "forward as attachment") is
 
 | Signal | How it is obtained | Strength |
 |---|---|---|
-| `Date` offset on the item | Transport headers, judged by who wrote them: the path (Message-ID format, Exchange headers) and the device (X-Mailer/User-Agent, mobile signatures). Writer classes that emit `+0000` all year in this mailbox are treated as UTC-normalised and their `+0000` is ignored | weak (desktop/service) / moderate (phone with clock check passed) |
+| `Date` offset on the item | Transport headers, judged by who wrote them: the path (Message-ID format, Exchange headers) and the device (X-Mailer/User-Agent, mobile signatures). Writer classes that emit `+0000` when neither a configured place nor UK/Irish time is on `+0000` (or on 90% of items all year) are treated as UTC-normalised and their `+0000` is ignored; a `+0000` from a class too small to measure is never read as a place outside the configured ones | weak (desktop/service) / moderate (phone with clock check passed) |
 | Clock check | `Date` (device clock and zone) vs the first `Received` timestamp (server clock); whole-hour differences mean a mis-set time zone, and that offset is not used | filter |
 | Phone vs laptop for sent items without headers | Outlook property fingerprints, labelled from sent items whose device is known (signature, or a header copy) | per cluster, with purity |
 | Offset for sent items without headers | Another copy of the same `Message-ID` in the mailbox (cc to self, distribution lists, forwards as attachment) | as above |

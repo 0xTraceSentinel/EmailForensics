@@ -411,13 +411,15 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
         parts.append('<h2 id="coverage">What this mailbox can show</h2>')
         sent = cov["custodian_sent"] or 0
         with_offset = sum(v for k, v in cov["sent_offsets"].items() if k != "none")
-        located = sum(v for k, v in cov["sent_places"].items() if k != "unknown")
+        located = sum(v for k, v in cov["sent_places"].items() if k not in ("unknown", "OTHER"))
+        elsewhere = cov["sent_places"].get("OTHER", 0)
         stats = [
             (f"{cov['messages']:,}", "top-level items"),
             (f"{fmt_dt(cov['first'])[:10]} → {fmt_dt(cov['last'])[:10]}", "date range (UTC)"),
             (f"{sent:,}", "items sent by the custodian"),
             (f"{(with_offset / sent * 100 if sent else 0):.0f}%", "of sent items with any time zone offset"),
-            (f"{(located / sent * 100 if sent else 0):.0f}%", "of sent items with a location signal"),
+            (f"{(located / sent * 100 if sent else 0):.0f}%", "of sent items with a signal for a configured place"),
+            (f"{elsewhere:,}", "sent items whose only signal is an offset matching no configured place"),
             (f"{cov['mobile_sent']:,}", "sent from a phone or tablet"),
             (f"{cov['uninformative']:,}", "sent-item offsets judged uninformative"),
             (f"{cov['attachments_meta']:,}/{cov['attachments']:,}", "attachments with document metadata"),
@@ -444,10 +446,12 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
         parts.append('<p class="note">Each Date header is classified by the software path that wrote it (from the Message-ID '
                      'format and Exchange headers) and the device (from X-Mailer/User-Agent, mobile signatures, and, for sent '
                      'items without headers, Exchange ClientInfo or Outlook property fingerprints). A writer class is '
-                     '"UTC-normalised" when it writes +0000 on dates when no configured place is on +0000 (for example '
-                     'Irish summer time, or any date for South Africa/Mauritius): at least 20% of such items for a known '
+                     '"UTC-normalised" when it writes +0000 on dates when neither a configured place nor the UTC reference '
+                     'zone (Europe/London by default, so UK/Irish summer time) is on +0000: at least 20% of such items for a known '
                      'person, 50% for a class pooling many senders. Its +0000 offsets are then ignored, including in winter. '
-                     'Classes with too few such dates fall back to +0000 on 90% of 20+ items across the year. '
+                     'Classes with too few such dates fall back to +0000 on 90% of 20+ items across the year. A +0000 from '
+                     'a class with too few items for either rule is never read as a place outside the configured ones. '
+                     'Senders on +0000 all year (e.g. Iceland, Ghana) cannot be told apart from UTC normalisation this way. '
                      'These rules are measured on this mailbox, not assumed.</p>')
         profiles = stats_run.get("writer_profiles") or {}
         ordered = sorted(profiles.items(), key=lambda kv: ("|" not in kv[0], -kv[1]["messages"]))
@@ -468,8 +472,10 @@ def build_report(case: Case, settings: Settings, out: Path, verify: bool = True)
                          f'{fc.get("items_labelled_by_cluster", 0):,} items labelled this way.</p>')
         parts.append("<h3>Device clock vs first server clock</h3>")
         parts.append('<p class="note">The Date header (device clock and time zone) is compared with the timestamp of the first '
-                     'Received header (server clock). "whole_hours_off" means the device\'s time zone setting did not match its clock, '
-                     'so its offset is not used.</p>')
+                     'Received header (server clock). "whole_hours_off" means the Date is whole hours after the server '
+                     'received the message, which a delay cannot explain: the device\'s time zone setting did not match its clock, '
+                     'so its offset is not used. "whole_hours_late" means the server received it whole hours after its Date: either '
+                     'a delayed send (offline draft, outbox queue) or a mis-set zone, so the offset is kept but only as weak.</p>')
         parts.append(_table(["Result", "Custodian and known people", "All items"], [[esc(k), f"{a:,}", f"{b:,}"] for k, a, b in cov["clock"]]))
         qv = stats_run.get("quoted_vs_date") or {}
         if qv.get("both_placed"):
@@ -632,9 +638,15 @@ STRENGTH_RUBRIC = [
      "Laptops often keep their home time zone when travelling; the offset reflects a setting."),
     ("Date offset written by a mail service", "weak",
      "Reflects the account or browser time zone setting, or UTC normalisation (then ignored)."),
-    ("+0000 from a UTC-normalised writer class", "none (ignored)", "Measured in this mailbox: the writer emits +0000 all year."),
-    ("Date offset with the device clock whole hours off the server clock", "none (ignored)",
-     "The device's time zone did not match its clock, so the offset is not a reliable setting."),
+    ("+0000 from a UTC-normalised writer class", "none (ignored)",
+     "Measured in this mailbox: the writer emits +0000 on dates when no configured place or UK/Irish time is on +0000 "
+     "(20% of such items for a person, 50% for a pooled class), or on 90% of items across the year."),
+    ("Date offset whole hours after the first server's clock", "none (ignored)",
+     "A delay cannot explain it: the device's time zone did not match its clock."),
+    ("Date offset whole hours before the first server's clock", "weak",
+     "Either a delayed send or a mis-set time zone; kept but never graded above weak."),
+    ("Offset matching no configured place (\"other\")", "weak, not counted as located",
+     "Shown for context; +0000 is used only from a writer class measured not to normalise to UTC."),
     ("Quoted reply header time zone", "weak", "Display setting of the replier's mail client."),
     ("Offset recovered from another copy (cc to self, distribution list)", "same as the copy", "Same Date header, so same writer and clock."),
     ("Self-statement ('landed in…', 'back in…')", "moderate", "The person's own words at that time; can be wrong or joking."),

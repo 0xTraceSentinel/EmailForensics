@@ -76,33 +76,55 @@ class OffsetMatch:
 
 
 class ZoneIndex:
-    def __init__(self, places: dict[str, tuple[tuple[str, ...], tuple[int, ...]]], sample: int = 8) -> None:
+    def __init__(self, places: dict[str, tuple[tuple[str, ...], tuple[int, ...]]], sample: int = 8,
+                 utc_reference: tuple[str, ...] = ()) -> None:
         self.places = places
         self.sample = sample
         self.configured = {z for zones, _ in places.values() for z in zones}
+        world = _world()
+        self.own = {c for z, c in world if z in self.configured and c}
+        self.others = tuple((z, c) for z, c in world if z not in self.configured and not (c and c in self.own))
+        self.utc_reference = tuple(z for z in utc_reference if _zone(z) is not None)
+        self._full: dict[tuple[int, datetime], OffsetMatch] = {}
+        self._local: dict[tuple[int, datetime], tuple[tuple[str, ...], tuple[str, ...]]] = {}
+
+    @staticmethod
+    def _hour(when: date | datetime) -> datetime:
+        if isinstance(when, datetime):
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            return when.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        return datetime.combine(when, time(12), tzinfo=timezone.utc)
+
+    def _places_at(self, minutes: int, at: datetime) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        key = (minutes, at)
+        hit = self._local.get(key)
+        if hit is None:
+            hits, zones = [], []
+            for code, (pzones, offsets) in self.places.items():
+                if pzones:
+                    matched = [z for z in pzones if offset_at(z, at) == minutes]
+                    if matched:
+                        hits.append(code)
+                        zones += matched
+                elif minutes in offsets:
+                    hits.append(code)
+            hit = self._local[key] = (tuple(hits), tuple(zones))
+        return hit
 
     def match(self, minutes: int, when: date | datetime) -> OffsetMatch:
-        if isinstance(when, datetime):
-            hour = when.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        else:
-            hour = datetime.combine(when, time(12), tzinfo=timezone.utc)
-        return self._match(minutes, hour)
-
-    @lru_cache(maxsize=262144)
-    def _match(self, minutes: int, at: datetime) -> OffsetMatch:
-        hits, zones = [], []
-        for code, (pzones, offsets) in self.places.items():
-            if pzones:
-                matched = [z for z in pzones if offset_at(z, at) == minutes]
-                if matched:
-                    hits.append(code)
-                    zones += matched
-            elif minutes in offsets:
-                hits.append(code)
-        own = {c for z, c in _world() if z in self.configured}
-        others = sorted({country_name(c) if c else z for z, c in _world()
-                         if z not in self.configured and c not in own and offset_at(z, at) == minutes})
-        return OffsetMatch(tuple(hits), tuple(zones), tuple(others[: self.sample]), len(others))
+        at = self._hour(when)
+        key = (minutes, at)
+        hit = self._full.get(key)
+        if hit is None:
+            places, zones = self._places_at(minutes, at)
+            others = sorted({country_name(c) if c else z for z, c in self.others if offset_at(z, at) == minutes})
+            hit = self._full[key] = OffsetMatch(places, zones, tuple(others[: self.sample]), len(others))
+        return hit
 
     def any_place_at(self, minutes: int, when: date | datetime) -> bool:
-        return bool(self.match(minutes, when).places)
+        return bool(self._places_at(minutes, self._hour(when))[0])
+
+    def utc_is_local_at(self, when: date | datetime) -> bool:
+        at = self._hour(when)
+        return bool(self._places_at(0, at)[0]) or any(offset_at(z, at) == 0 for z in self.utc_reference)
